@@ -1471,7 +1471,7 @@ bool X86FrameLowering::needsDwarfCFI(const MachineFunction &MF) const {
 */
 
 void X86FrameLowering::emitPrologue(MachineFunction &MF,
-                                    MachineBasicBlock &MBB) const {
+                                    MachineBasicBlock &MBB) const {  
   assert(&STI == &MF.getSubtarget<X86Subtarget>() &&
          "MF used frame lowering for wrong subtarget");
   MachineBasicBlock::iterator MBBI = MBB.begin();
@@ -1503,6 +1503,12 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
   Register BasePtr = TRI->getBaseRegister();
   bool HasWinCFI = false;
 
+#if 0
+  llvm::errs() << MF.getName() << "\n"
+	       << "FramePtr: " << FramePtr << "\n"
+	       << "MachineFramePtr: " << MachineFramePtr << "\n";
+#endif
+  
   // Debug location must be unknown since the first debug location is used
   // to determine the end of the prologue.
   DebugLoc DL;
@@ -2382,16 +2388,13 @@ StackOffset X86FrameLowering::getFrameIndexReference(const MachineFunction &MF,
                                                      Register &FrameReg) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
 
-  bool IsFixed = MFI.isFixedObjectIndex(FI);
   // We can't calculate offset from frame pointer if the stack is realigned,
   // so enforce usage of stack/base pointer.  The base pointer is used when we
   // have dynamic allocas in addition to dynamic realignment.
   if (TRI->hasBasePointer(MF))
-    FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getBaseRegister();
-  else if (TRI->hasStackRealignment(MF))
-    FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getStackRegister();
+    FrameReg = TRI->getBaseRegister();
   else
-    FrameReg = TRI->getFrameRegister(MF);
+    FrameReg = TRI->getStackRegister();
 
   // Offset will hold the offset from the stack pointer at function entry to the
   // object.
