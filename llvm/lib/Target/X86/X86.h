@@ -145,6 +145,8 @@ FunctionPass *createX86InsertX87waitPass();
 /// ways.
 FunctionPass *createX86PartialReductionPass();
 
+  FunctionPass *createX86FunctionLocalStacksPass();
+
 InstructionSelector *createX86InstructionSelector(const X86TargetMachine &TM,
                                                   X86Subtarget &,
                                                   X86RegisterBankInfo &);
@@ -181,6 +183,7 @@ void initializeX86LowerAMXTypeLegacyPassPass(PassRegistry &);
 void initializeX86PreAMXConfigPassPass(PassRegistry &);
 void initializeX86LowerTileCopyPass(PassRegistry &);
 void initializeX86LowerAMXIntrinsicsLegacyPassPass(PassRegistry &);
+  void initializeX86FunctionLocalStacksPass(PassRegistry& );
 
 namespace X86AS {
 enum : unsigned {

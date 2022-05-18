@@ -1696,6 +1696,24 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
     }
   }
 
+  // CLOU: load function-local stack
+  {
+    const Function& F = MF.getFunction();
+    const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
+    BuildMI(MBB, MBBI, DL, TII.get(X86::MOV64rm), X86::RSP)
+      .addReg(X86::RIP)
+      .addImm(1)
+      .addReg(X86::NoRegister)
+      .addGlobalAddress(sp, 0)
+      .addReg(X86::NoRegister)
+      .addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp),
+					     MachineMemOperand::MOLoad,
+					     8,
+					     Align(8)));
+    constexpr int64_t padding = 64;
+    emitSPUpdate(MBB, MBBI, DL, -padding, false);
+  }
+
   // Realign stack after we pushed callee-saved registers (so that we'll be
   // able to calculate their offsets from the frame pointer).
   // Don't do this for Win64, it needs to realign the stack after the prologue.
@@ -2193,8 +2211,8 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
   // slot before popping them off! Same applies for the case, when stack was
   // realigned. Don't do this if this was a funclet epilogue, since the funclets
   // will not do realignment or dynamic stack allocation.
-  if (((TRI->hasStackRealignment(MF)) || MFI.hasVarSizedObjects()) &&
-      !IsFunclet) {
+  if ((((TRI->hasStackRealignment(MF)) || MFI.hasVarSizedObjects()) &&
+       !IsFunclet) || true) {
     if (TRI->hasStackRealignment(MF))
       MBBI = FirstCSPop;
     unsigned SEHFrameOffset = calculateSetFPREG(SEHStackAllocAmt);
@@ -2211,6 +2229,7 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
     // 'mov %FramePtr, %rsp' will not be recognized as an epilogue sequence.
     // However, we may use this sequence if we have a frame pointer because the
     // effects of the prologue can safely be undone.
+#if 1
     if (LEAAmount != 0) {
       unsigned Opc = getLEArOpcode(Uses64BitFramePtr);
       addRegOffset(BuildMI(MBB, MBBI, DL, TII.get(Opc), StackPtr),
@@ -2222,6 +2241,11 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
         .addReg(FramePtr);
       --MBBI;
     }
+#else
+    // TODO: this is actually broken
+    const auto tmp = addRegOffset(BuildMI(MBB, MBBI, DL, TII.get(getLEArOpcode(Uses64BitFramePtr)), StackPtr), X86::RBX, false, NumBytes);
+    errs() << *tmp.getInstr() << "\n";
+#endif
   } else if (NumBytes) {
     // Adjust stack pointer back: ESP += numbytes.
     emitSPUpdate(MBB, MBBI, DL, NumBytes, /*InEpilogue=*/true);

@@ -1,3 +1,4 @@
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
@@ -31,16 +32,13 @@ namespace {
 	}
       }
 
-      // create new function that accesses all these
-      // Function *F = Function::Create(FunctionType::get(Type::getVoidTy(M.getContext())), LinkageType::ExternalLinkage);
-      
-
-      
       return true;
     }
 
     template <class OutputIt>
     void runOnFunction(Function& F, OutputIt out) {
+      // F.addFnAttr(Attribute::get(F.getContext(), "stackrealign"
+      
       Module& M = *F.getParent();
 
       // Type:
@@ -66,14 +64,18 @@ namespace {
       sp->setDSOLocal(true);
       stack->setAlignment(max_align);
       sp->setAlignment(Align(8)); // TODO: actually compute size of pointer?
-      stack->setSection("bss");
-      sp->setSection("data");
-
-      errs() << F.getName() << "\n";
-      errs() << "isConstant: " << stack->isConstant() << "\n";
 
       *out++ = stack;
       *out++ = sp;
+
+      // Save old function-local stack pointer on entry + exit
+      LoadInst *LI = IRBuilder<>(&F.getEntryBlock().front()).CreateLoad(sp_ty, sp);
+      for (BasicBlock &B : F) {
+	Instruction *I = &B.back();
+	if (isa<ReturnInst>(I)) {
+	  IRBuilder<>(I).CreateStore(LI, sp);
+	}
+      }
     }
   };
 }

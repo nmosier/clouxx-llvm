@@ -639,10 +639,19 @@ void X86RegisterInfo::adjustStackMapLiveOutMask(uint32_t *Mask) const {
 //===----------------------------------------------------------------------===//
 
 static bool CantUseSP(const MachineFrameInfo &MFI) {
+#if 0
   return MFI.hasVarSizedObjects() || MFI.hasOpaqueSPAdjustment();
+#else
+  return true;
+#endif
 }
 
 bool X86RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
+#if 0
+#else
+  return true;
+#endif
+  
   const X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
   if (X86FI->hasPreallocatedCall())
     return true;
