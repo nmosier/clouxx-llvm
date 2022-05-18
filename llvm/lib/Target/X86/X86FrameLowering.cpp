@@ -1387,6 +1387,8 @@ bool X86FrameLowering::needsDwarfCFI(const MachineFunction &MF) const {
 
 void X86FrameLowering::emitPrologue(MachineFunction &MF,
                                     MachineBasicBlock &MBB) const {
+  errs() << "emitPrologue:\n" << MBB << "\n\n";
+  
   assert(&STI == &MF.getSubtarget<X86Subtarget>() &&
          "MF used frame lowering for wrong subtarget");
   MachineBasicBlock::iterator MBBI = MBB.begin();
@@ -2502,6 +2504,12 @@ bool X86FrameLowering::assignCalleeSavedSpillSlots(
   MachineFrameInfo &MFI = MF.getFrameInfo();
   X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
 
+  errs() << __FUNCTION__ << ": ";
+  for (const auto& x : CSI) {
+    errs() << " " << x.getReg();
+  }
+  errs() << "\n";
+
   unsigned CalleeSavedFrameSize = 0;
   unsigned XMMCalleeSavedFrameSize = 0;
   auto &WinEHXMMSlotInfo = X86FI->getWinEHXMMSlotInfo();
@@ -2614,7 +2622,14 @@ bool X86FrameLowering::spillCalleeSavedRegisters(
     ArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
   DebugLoc DL = MBB.findDebugLoc(MI);
 
-  // Don't save CSRs in 32-bit EH funclets. The caller saves EBX, EBP, ESI, EDI
+#if 0
+  auto CSI = CSI_.vec();
+  {
+    const unsigned force_save_regs[] = {X86::R12, X86::R13, X86::R14, X86::R15};
+    std::copy(std::begin(force_save_regs), std::end(force_save_regs), std::back_inserter(CSI));
+  }
+#endif
+
   // for us, and there are no XMM CSRs on Win32.
   if (MBB.isEHFuncletEntry() && STI.is32Bit() && STI.isOSWindows())
     return true;
@@ -2767,6 +2782,13 @@ void X86FrameLowering::determineCalleeSaves(MachineFunction &MF,
                                             BitVector &SavedRegs,
                                             RegScavenger *RS) const {
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
+
+  // CLOU: force saves of r12-r15
+#if 1
+  for (const auto reg : std::array<unsigned, 4> {X86::R12, X86::R13, X86::R14, X86::R15}) {
+    SavedRegs.set(reg);
+  }
+#endif
 
   // Spill the BasePtr if it's used.
   if (TRI->hasBasePointer(MF)){
