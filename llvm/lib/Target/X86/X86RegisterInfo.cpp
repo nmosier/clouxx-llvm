@@ -657,7 +657,11 @@ bool X86RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
   // can't address variables from the stack pointer.  MS inline asm can
   // reference locals while also adjusting the stack pointer.  When we can't
   // use both the SP and the FP, we need a separate base pointer register.
+#if 0
   bool CantUseFP = hasStackRealignment(MF);
+#else
+  bool CantUseFP = true;
+#endif
   return CantUseFP && CantUseSP(MFI);
 }
 

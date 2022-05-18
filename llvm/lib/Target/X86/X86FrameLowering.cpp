@@ -2287,7 +2287,6 @@ StackOffset X86FrameLowering::getFrameIndexReference(const MachineFunction &MF,
                                                      Register &FrameReg) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
 
-#if 0
   bool IsFixed = MFI.isFixedObjectIndex(FI);
   // We can't calculate offset from frame pointer if the stack is realigned,
   // so enforce usage of stack/base pointer.  The base pointer is used when we
@@ -2298,12 +2297,6 @@ StackOffset X86FrameLowering::getFrameIndexReference(const MachineFunction &MF,
     FrameReg = IsFixed ? TRI->getFramePtr() : TRI->getStackRegister();
   else
     FrameReg = TRI->getFrameRegister(MF);
-#else
-  if (TRI->hasBasePointer(MF))
-    FrameReg = TRI->getBaseRegister();
-  else
-    FrameReg = TRI->getStackRegister();
-#endif
 
   // Offset will hold the offset from the stack pointer at function entry to the
   // object.

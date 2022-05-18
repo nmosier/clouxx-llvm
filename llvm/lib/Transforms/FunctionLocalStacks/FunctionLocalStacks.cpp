@@ -10,9 +10,11 @@
 
 using namespace llvm;
 
+constexpr const char *sep = "_";
+
 namespace {
 
-  constexpr uint64_t stack_size = 4096;
+  constexpr uint64_t stack_size = 0x20000;
   const Align max_align (256);
 
   struct FunctionLocalStacks final: public ModulePass {
@@ -21,33 +23,57 @@ namespace {
     FunctionLocalStacks(): ModulePass(ID) {}
 
     virtual bool runOnModule(Module& M) override {
+      std::vector<GlobalVariable *> GVs;
+      
       for (Function& F : M) {
 	if (!F.isDeclaration()) {
-	  runOnFunction(F);
+	  runOnFunction(F, std::back_inserter(GVs));
 	}
       }
+
+      // create new function that accesses all these
+      // Function *F = Function::Create(FunctionType::get(Type::getVoidTy(M.getContext())), LinkageType::ExternalLinkage);
+      
+
+      
       return true;
     }
-			   
-    bool runOnFunction(Function& F) {
+
+    template <class OutputIt>
+    void runOnFunction(Function& F, OutputIt out) {
       Module& M = *F.getParent();
 
       // Type:
       Type *stack_ty = ArrayType::get(IntegerType::getInt8Ty(F.getContext()), stack_size);
       Type *sp_ty = PointerType::get(IntegerType::getInt8Ty(F.getContext()), 0);
-      const auto stack_name = (F.getName() + ".stack").str();
-      const auto sp_name = (F.getName() + ".sp").str();
+      const auto stack_name = (F.getName() + sep + "stack").str();
+      const auto sp_name = (F.getName() + sep + "sp").str();
 
-      GlobalVariable *stack = new GlobalVariable(M, stack_ty, false, GlobalVariable::InternalLinkage, Constant::getNullValue(stack_ty), stack_name, nullptr, GlobalValue::GeneralDynamicTLSModel);
-      GlobalVariable *sp = new GlobalVariable(M, sp_ty, false, GlobalVariable::InternalLinkage, ConstantExpr::getBitCast(stack, sp_ty), sp_name, nullptr, GlobalValue::GeneralDynamicTLSModel);
+      // determine correct linkage
+      GlobalVariable::LinkageTypes linkage = F.getLinkage();
+
+      GlobalVariable *stack = new GlobalVariable(M, stack_ty, false, linkage, Constant::getNullValue(stack_ty), stack_name, nullptr, GlobalValue::NotThreadLocal);
+      GlobalVariable *sp = new GlobalVariable(M,
+					      sp_ty,
+					      false,
+					      linkage,
+					      ConstantExpr::getBitCast(ConstantExpr::getGetElementPtr(stack_ty, stack,
+												      Constant::getIntegerValue(Type::getInt8Ty(M.getContext()),
+																APInt(8, 1))),
+								       sp_ty),
+					      sp_name, nullptr, GlobalValue::NotThreadLocal);
       stack->setDSOLocal(true);
       sp->setDSOLocal(true);
       stack->setAlignment(max_align);
       sp->setAlignment(Align(8)); // TODO: actually compute size of pointer?
+      stack->setSection("bss");
+      sp->setSection("data");
 
       errs() << F.getName() << "\n";
-      
-      return true;
+      errs() << "isConstant: " << stack->isConstant() << "\n";
+
+      *out++ = stack;
+      *out++ = sp;
     }
   };
 }
@@ -63,4 +89,4 @@ namespace {
 }
 
 static RegisterStandardPasses Y (PassManagerBuilder::EP_EnabledOnOptLevel0, reg);
-static RegisterStandardPasses Z (PassManagerBuilder::EP_ModuleOptimizerEarly, reg);
+static RegisterStandardPasses Z (PassManagerBuilder::/*EP_ModuleOptimizerEarly*/EP_OptimizerLast, reg);
