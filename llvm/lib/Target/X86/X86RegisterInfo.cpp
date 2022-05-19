@@ -33,6 +33,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
+#include "X86FunctionLocalStacks.h"
 
 using namespace llvm;
 
@@ -639,18 +640,15 @@ void X86RegisterInfo::adjustStackMapLiveOutMask(uint32_t *Mask) const {
 //===----------------------------------------------------------------------===//
 
 static bool CantUseSP(const MachineFrameInfo &MFI) {
-#if 0
+  if (EnableFunctionLocalStacks)
+    return true;
+
   return MFI.hasVarSizedObjects() || MFI.hasOpaqueSPAdjustment();
-#else
-  return true;
-#endif
 }
 
 bool X86RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
-#if 0
-#else
-  return true;
-#endif
+  if (EnableFunctionLocalStacks)
+    return true;
   
   const X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
   if (X86FI->hasPreallocatedCall())
@@ -666,11 +664,7 @@ bool X86RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
   // can't address variables from the stack pointer.  MS inline asm can
   // reference locals while also adjusting the stack pointer.  When we can't
   // use both the SP and the FP, we need a separate base pointer register.
-#if 0
   bool CantUseFP = hasStackRealignment(MF);
-#else
-  bool CantUseFP = true;
-#endif
   return CantUseFP && CantUseSP(MFI);
 }
 

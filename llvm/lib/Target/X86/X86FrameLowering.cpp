@@ -32,6 +32,7 @@
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Target/TargetOptions.h"
+#include "X86FunctionLocalStacks.h"
 #include <cstdlib>
 
 #define DEBUG_TYPE "x86-fl"
@@ -1387,8 +1388,6 @@ bool X86FrameLowering::needsDwarfCFI(const MachineFunction &MF) const {
 
 void X86FrameLowering::emitPrologue(MachineFunction &MF,
                                     MachineBasicBlock &MBB) const {
-  errs() << "emitPrologue:\n" << MBB << "\n\n";
-  
   assert(&STI == &MF.getSubtarget<X86Subtarget>() &&
          "MF used frame lowering for wrong subtarget");
   MachineBasicBlock::iterator MBBI = MBB.begin();
@@ -1699,7 +1698,7 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
   }
 
   // CLOU: load function-local stack
-  {
+  if (EnableFunctionLocalStacks) {
     const Function& F = MF.getFunction();
     const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
     BuildMI(MBB, MBBI, DL, TII.get(X86::MOV64rm), X86::RSP)
@@ -2214,7 +2213,7 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
   // realigned. Don't do this if this was a funclet epilogue, since the funclets
   // will not do realignment or dynamic stack allocation.
   if ((((TRI->hasStackRealignment(MF)) || MFI.hasVarSizedObjects()) &&
-       !IsFunclet) || true) {
+       !IsFunclet) || EnableFunctionLocalStacks) {
     if (TRI->hasStackRealignment(MF))
       MBBI = FirstCSPop;
     unsigned SEHFrameOffset = calculateSetFPREG(SEHStackAllocAmt);
@@ -2231,7 +2230,6 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
     // 'mov %FramePtr, %rsp' will not be recognized as an epilogue sequence.
     // However, we may use this sequence if we have a frame pointer because the
     // effects of the prologue can safely be undone.
-#if 1
     if (LEAAmount != 0) {
       unsigned Opc = getLEArOpcode(Uses64BitFramePtr);
       addRegOffset(BuildMI(MBB, MBBI, DL, TII.get(Opc), StackPtr),
@@ -2243,11 +2241,6 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
         .addReg(FramePtr);
       --MBBI;
     }
-#else
-    // TODO: this is actually broken
-    const auto tmp = addRegOffset(BuildMI(MBB, MBBI, DL, TII.get(getLEArOpcode(Uses64BitFramePtr)), StackPtr), X86::RBX, false, NumBytes);
-    errs() << *tmp.getInstr() << "\n";
-#endif
   } else if (NumBytes) {
     // Adjust stack pointer back: ESP += numbytes.
     emitSPUpdate(MBB, MBBI, DL, NumBytes, /*InEpilogue=*/true);
@@ -2504,12 +2497,6 @@ bool X86FrameLowering::assignCalleeSavedSpillSlots(
   MachineFrameInfo &MFI = MF.getFrameInfo();
   X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
 
-  errs() << __FUNCTION__ << ": ";
-  for (const auto& x : CSI) {
-    errs() << " " << x.getReg();
-  }
-  errs() << "\n";
-
   unsigned CalleeSavedFrameSize = 0;
   unsigned XMMCalleeSavedFrameSize = 0;
   auto &WinEHXMMSlotInfo = X86FI->getWinEHXMMSlotInfo();
@@ -2621,14 +2608,6 @@ bool X86FrameLowering::spillCalleeSavedRegisters(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI,
     ArrayRef<CalleeSavedInfo> CSI, const TargetRegisterInfo *TRI) const {
   DebugLoc DL = MBB.findDebugLoc(MI);
-
-#if 0
-  auto CSI = CSI_.vec();
-  {
-    const unsigned force_save_regs[] = {X86::R12, X86::R13, X86::R14, X86::R15};
-    std::copy(std::begin(force_save_regs), std::end(force_save_regs), std::back_inserter(CSI));
-  }
-#endif
 
   // for us, and there are no XMM CSRs on Win32.
   if (MBB.isEHFuncletEntry() && STI.is32Bit() && STI.isOSWindows())
@@ -2784,11 +2763,11 @@ void X86FrameLowering::determineCalleeSaves(MachineFunction &MF,
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
 
   // CLOU: force saves of r12-r15
-#if 1
-  for (const auto reg : std::array<unsigned, 4> {X86::R12, X86::R13, X86::R14, X86::R15}) {
-    SavedRegs.set(reg);
+  if (EnableFunctionLocalStacks) {
+    for (const auto reg : std::array<unsigned, 4> {X86::R12, X86::R13, X86::R14, X86::R15}) {
+      SavedRegs.set(reg);
+    }
   }
-#endif
 
   // Spill the BasePtr if it's used.
   if (TRI->hasBasePointer(MF)){

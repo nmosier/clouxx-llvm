@@ -7,6 +7,16 @@
 
 using namespace llvm;
 
+namespace llvm {
+
+cl::opt<bool> EnableFunctionLocalStacks("x86-function-local-stacks",
+					cl::desc("Force enable function-local stacks"),
+					cl::init(false),
+					cl::Hidden
+					);
+  
+}
+
 namespace {
 
   class X86FunctionLocalStacks final: public MachineFunctionPass {
@@ -18,6 +28,10 @@ namespace {
     }
 
     virtual bool runOnMachineFunction(MachineFunction& MF) override {
+      if (!EnableFunctionLocalStacks) {
+	return false;
+      }
+      
       const TargetInstrInfo *TII = MF.getSubtarget<X86Subtarget>().getInstrInfo();
       const Function& F = MF.getFunction();
       const GlobalValue *sp = MF.getFunction().getParent()->getNamedValue((F.getName() + "_sp").str());

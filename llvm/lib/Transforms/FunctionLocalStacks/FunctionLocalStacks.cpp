@@ -37,7 +37,7 @@ namespace {
 
     template <class OutputIt>
     void runOnFunction(Function& F, OutputIt out) {
-      // F.addFnAttr(Attribute::get(F.getContext(), "stackrealign"
+      F.addFnAttr(Attribute::get(F.getContext(), "stackrealign"));
       
       Module& M = *F.getParent();
 
