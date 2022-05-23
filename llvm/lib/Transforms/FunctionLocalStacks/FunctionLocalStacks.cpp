@@ -48,7 +48,12 @@ namespace {
       const auto sp_name = (F.getName() + sep + "sp").str();
 
       // determine correct linkage
+#if 0
       GlobalVariable::LinkageTypes linkage = F.getLinkage();
+      errs() << "LINKAGE: " << linkage << "\n";
+#else
+      GlobalVariable::LinkageTypes linkage = GlobalVariable::LinkageTypes::InternalLinkage;
+#endif
 
       GlobalVariable *stack = new GlobalVariable(M, stack_ty, false, linkage, Constant::getNullValue(stack_ty), stack_name, nullptr, GlobalValue::NotThreadLocal);
       GlobalVariable *sp = new GlobalVariable(M,
