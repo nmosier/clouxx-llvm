@@ -28,13 +28,6 @@ namespace {
     FunctionLocalStacks(): ModulePass(ID) {}
 
     virtual bool runOnModule(Module& M) override {
-#if 0
-      Function *oldMalloc;
-      Function *newMalloc;
-      emitNewMalloc(M, &oldMalloc, &newMalloc);
-      replaceMalloc(oldMalloc, newMalloc);
-#endif
-
       // for every function declaration, emit tentative wrappers
       {
 	std::vector<Function *> todo;
@@ -47,6 +40,8 @@ namespace {
 	  }
 	}
       }
+
+      replaceMalloc(M);
       
       std::vector<GlobalVariable *> GVs;
       
@@ -102,61 +97,42 @@ namespace {
       }
     }
 
-    void emitNewMalloc(Module& M, Function **oldMallocP, Function **newMallocP) {
+    void replaceMalloc(Module& M) {
       auto& ctx = M.getContext();
-      
-      Function *oldMalloc = M.getFunction("malloc");
-      if (oldMalloc == nullptr) {
-	std::vector<Type *> types = {Type::getInt64Ty(ctx)};
-	FunctionType *mallocTy = FunctionType::get(Type::getInt8PtrTy(ctx), types, false);
+      if (Function *F = M.getFunction("__clou_wrap_malloc")) {
+	// find call instruction
+	for (BasicBlock& B : *F) {
+	  for (Instruction& I : B) {
+	    if (CallInst *C = dyn_cast<CallInst>(&I)) {
+	      if (Function *callee = C->getCalledFunction()) {
+		if (callee->getName() == "malloc") {
+		  Type *I64 = Type::getInt64Ty(ctx);
+		
+		  // get declaration of calloc
+		  Function *callocF = M.getFunction("calloc");
+		  if (callocF == nullptr) {
+		    std::vector<Type *> args = {I64, I64};
+		    FunctionType *callocT = FunctionType::get(Type::getInt8PtrTy(ctx), args, false);
+		    callocF = Function::Create(callocT, Function::LinkageTypes::ExternalLinkage, "calloc", M);
+		  }
 
-	// Declare malloc
-	oldMalloc = Function::Create(mallocTy, Function::LinkageTypes::ExternalLinkage, "malloc", M);
-      }
-      assert(oldMalloc);
-      assert(oldMalloc->getType());
-      assert(oldMalloc->getType()->getPointerElementType());
-      FunctionType *mallocTy = cast<FunctionType>(oldMalloc->getType()->getPointerElementType());
-      Function *newMalloc = Function::Create(mallocTy, Function::LinkageTypes::WeakAnyLinkage, "malloc_clou", M);
-
-      BasicBlock *B = BasicBlock::Create(ctx, "", newMalloc);
-      IRBuilder<> IRB (B, B->begin());
-
-      // fence
-      InlineAsm *IA = InlineAsm::get(FunctionType::get(Type::getVoidTy(ctx), false), "lfence", "", false, InlineAsm::AD_Intel);
-      IRB.CreateCall(IA);
-
-      // call to old malloc
-      std::vector<Value *> args;
-      for (Argument& A : newMalloc->args()) {
-	args.push_back(&A);
-      }
-      Instruction *C = IRB.CreateCall(mallocTy, oldMalloc, args);
-
-      // return
-      IRB.CreateRet(C);
-
-      *oldMallocP = oldMalloc;
-      *newMallocP = newMalloc;
-    }
-
-    void replaceMalloc(Function *oldMalloc, Function *newMalloc) {
-      for (Use& U : oldMalloc->uses()) {
-	User *user = U.getUser();
-
-	// Don't replace if is the call to old malloc in new malloc!
-	if (Instruction *I = dyn_cast<Instruction>(user)) {
-	  if (I->getFunction() == newMalloc) {
-	    continue;
+		  IRBuilder<> IRB (C);
+		  std::vector<Value *> args = {F->getArg(0), ConstantInt::get(I64, 1)};
+		  CallInst *newC = IRB.CreateCall(callocF, args);
+		  for (User *U : C->users()) {
+		    U->replaceUsesOfWith(C, newC);
+		  }
+		  C->eraseFromParent();
+		  goto done;
+		}
+	      }
+	    }
 	  }
 	}
-
-	if (Constant *C = dyn_cast<Constant>(user)) {
-	  C->handleOperandChange(oldMalloc, newMalloc);
-	} else {
-	  user->replaceUsesOfWith(oldMalloc, newMalloc);
-	}
       }
+
+    done: ;
+      
     }
 
     InlineAsm *makeFence(LLVMContext& ctx) {
@@ -201,6 +177,8 @@ namespace {
       } else {
 	IRB.CreateRet(C);
       }
+
+      replaceUses(&F, newF);
     }
 
     void emitAliasForDefinition(Function& F) {
@@ -219,6 +197,24 @@ namespace {
       
       GlobalAlias::create(L::ExternalLinkage, wrapperName(F), &F);
       assert(F.getParent()->getNamedAlias(wrapperName(F).str()) != nullptr);
+    }
+
+    void replaceUses(Function *oldF, Function *newF) {
+      for (Use& U : oldF->uses()) {
+	User *user = U.getUser();
+
+	if (Instruction *I = dyn_cast<Instruction>(user)) {
+	  if (I->getFunction() == newF) {
+	    continue;
+	  }
+	}
+
+	if (Constant *C = dyn_cast<Constant>(user)) {
+	  C->handleOperandChange(oldF, newF);
+	} else {
+	  user->replaceUsesOfWith(oldF, newF);
+	}
+      }
     }
 		       
   };
