@@ -59,7 +59,6 @@ namespace {
       // set callee-saved regs
       static const MCPhysReg csrs[] = {X86::RBX, X86::R12, X86::R13, X86::R14, X86::R15};
       MF.getRegInfo().setCalleeSavedRegs(csrs);
-      errs() << "set callee-saved regs\n\n";
       
       return true;
     }
