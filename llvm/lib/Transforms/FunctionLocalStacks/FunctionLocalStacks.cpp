@@ -42,7 +42,8 @@ namespace {
       }
 
       replaceMalloc(M);
-      replaceRealloc(M);
+      replaceMemoryRealloc(M, "realloc");
+      replaceMemoryRealloc(M, "reallocarray");
       
       std::vector<GlobalVariable *> GVs;
       
@@ -98,6 +99,21 @@ namespace {
       }
     }
 
+    CallInst *findCallToFunction(Function& F, StringRef name) {
+      for (BasicBlock& B : F) {
+	for (Instruction& I : B) {
+	  if (CallInst *C = dyn_cast<CallInst>(&I)) {
+	    if (Function *callee = C->getCalledFunction()) {
+	      if (callee->getName() == name) {
+		return C;
+	      }
+	    }
+	  }
+	}
+      }
+      return nullptr;
+    }
+
     void replaceMalloc(Module& M) {
       auto& ctx = M.getContext();
       if (Function *F = M.getFunction("__clou_wrap_malloc")) {
@@ -117,6 +133,7 @@ namespace {
 		    callocF = Function::Create(callocT, Function::LinkageTypes::ExternalLinkage, "calloc", M);
 		  }
 
+
 		  IRBuilder<> IRB (C);
 		  std::vector<Value *> args = {F->getArg(0), ConstantInt::get(I64, 1)};
 		  CallInst *newC = IRB.CreateCall(callocF, args);
@@ -132,54 +149,43 @@ namespace {
 	  }
 	}
       }
-      
+
     }
 
-    void replaceRealloc(Module& M) {
-      /* realloc(3) causes issues because it doesn't zero-initialize any additional memory.
-       * We can fix this by using Linux's malloc_usable_size(3) and then memset(3).
-       */
-      
-      auto& ctx = M.getContext();
-      
-      if (Function *F = M.getFunction("__clou_wrap_realloc")) {
-	// find call instruction
-	for (BasicBlock& B : *F) {
-	  for (Instruction& I : B) {
-	    if (CallInst *C = dyn_cast<CallInst>(&I)) {
-	      if (Function *callee = C->getCalledFunction()) {
-		if (callee->getName() == "realloc") {
-		  Type *I64 = Type::getInt64Ty(ctx);
+    Function *getMallocUsableSizeDecl(Module& M) {
+      StringRef name = "malloc_usable_size";
+      if (Function *F = M.getFunction(name)) {
+	return F;
+      } else {
+	LLVMContext& ctx = M.getContext();
+	FunctionType *T = FunctionType::get(Type::getInt64Ty(ctx), std::vector<Type *> {Type::getInt8PtrTy(ctx)}, false);
+	return Function::Create(T, Function::ExternalLinkage, name, M);
+      }
+    }
 
-		  CallInst *reallocPointer = C;
+    void replaceMemoryRealloc(Function& wrapF, StringRef realName) {
+      LLVMContext& ctx = wrapF.getContext();
+      Module& M = *wrapF.getParent();
+      CallInst *reallocPtr = findCallToFunction(wrapF, realName);
+      assert(reallocPtr != nullptr);
+      IRBuilder<> preIRB (reallocPtr);
+      IRBuilder<> postIRB (reallocPtr->getNextNode());
+      Function *mallocUsableSizeF = getMallocUsableSizeDecl(M);
 
-		  IRBuilder<> IRB (reallocPointer->getNextNode());
+      CallInst *oldSize =  preIRB.CreateCall(mallocUsableSizeF, std::vector<Value *> {wrapF.getArg(0)});
+      CallInst *newSize = postIRB.CreateCall(mallocUsableSizeF, std::vector<Value *> {reallocPtr});
+      Value *sizeCmp    = postIRB.CreateICmpULT(oldSize, newSize);
+      Value *sizeDiff   = postIRB.CreateSub(newSize, oldSize);
+      Value *sizeDiffOrZero = postIRB.CreateSelect(sizeCmp, sizeDiff, Constant::getNullValue(Type::getInt64Ty(ctx)));
+      Value *gep = postIRB.CreateInBoundsGEP(reallocPtr->getType()->getPointerElementType(), reallocPtr,
+					     std::vector<Value *> {oldSize});
+      postIRB.CreateMemSet(gep, Constant::getNullValue(Type::getInt8Ty(ctx)), sizeDiffOrZero, MaybeAlign(16));
+    }
 
-
-		  // get declaration of malloc_usable_size()
-		  Function *malloc_usable_size_F = M.getFunction("malloc_usable_size");
-		  if (malloc_usable_size_F == nullptr) {
-		    std::vector<Type *> Ts = {Type::getInt8PtrTy(ctx)};
-		    FunctionType *malloc_usable_size_T = FunctionType::get(I64, Ts, false);
-		    malloc_usable_size_F = Function::Create(malloc_usable_size_T, Function::ExternalLinkage, "malloc_usable_size", M);
-		  }
-
-		  // get old size before call to realloc()
-		  CallInst *oldSize = IRBuilder<>(reallocPointer).CreateCall(malloc_usable_size_F,
-									     std::vector<Value *> {F->getArg(0)});
-		  CallInst *newSize = IRB.CreateCall(malloc_usable_size_F, std::vector<Value *> {reallocPointer});
-		  Value *sizeCmp = IRB.CreateICmpULT(oldSize, newSize);
-		  Value *sizeDiff = IRB.CreateSub(newSize, oldSize);
-		  Value *sizeDiffOrZero = IRB.CreateSelect(sizeCmp, sizeDiff, Constant::getNullValue(Type::getInt64Ty(ctx)));
-		  Value *gep = IRB.CreateInBoundsGEP(reallocPointer->getType()->getPointerElementType(), reallocPointer,
-						     std::vector<Value *> {oldSize});
-		  IRB.CreateMemSet(gep, Constant::getNullValue(Type::getInt8Ty(ctx)), sizeDiffOrZero, MaybeAlign(16));
-		  return;
-		}
-	      }
-	    }
-	  }
-	}
+    void replaceMemoryRealloc(Module& M, StringRef realName) {
+      const Twine wrapName = wrapperName(realName);
+      if (Function *F = M.getFunction(wrapName.str())) {
+	replaceMemoryRealloc(*F, realName);
       }
     }
       
@@ -188,8 +194,12 @@ namespace {
 			    false, InlineAsm::AD_Intel);
     }
 
+    Twine wrapperName(StringRef name) {
+      return "__clou_wrap_" + name;
+    }
+
     Twine wrapperName(Function& F) {
-      return "__clou_wrap_" + F.getName();
+      return wrapperName(F.getName());
     }
 
     void emitWrapperForDeclaration(Function& F) {
