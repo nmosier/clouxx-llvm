@@ -1,0 +1,21 @@
+usage() {
+    cat <<EOF
+usage: clou_env /path/to/clou/llvm
+EOF
+}
+
+DIR="$(dirname "$BASH_SOURCE")"
+
+CLOU_LIBNAMES=(FunctionLocalStacks SecurityCallingConv FunctionAttrs)
+CLOU_LIBPATHS=()
+for NAME in ${CLOU_LIBNAMES[@]}; do
+    CLOU_LIBPATHS+=(-Xclang -load -Xclang ${DIR}/build/lib/CLOU${NAME}.so)
+done
+
+CLOU_CC="${DIR}/build/bin/clang"
+CLOU_CFLAGS="-flegacy-pass-manager ${CLOU_LIBPATHS[@]} -mstackrealign -mllvm -no-stack-slot-sharing -mllvm -x86-function-local-stacks -mllvm -x86-indirect-branch-tracking"
+
+# -x86-indirect-branch-tracking -- Intel CET support
+# -mstackrealign -- always realign stack
+# -no-stack-slot-sharing -- prevent reusing stack locations for different variables
+
