@@ -42,6 +42,7 @@ namespace {
       }
 
       replaceMalloc(M);
+      replaceRealloc(M);
       
       std::vector<GlobalVariable *> GVs;
       
@@ -123,18 +124,65 @@ namespace {
 		    U->replaceUsesOfWith(C, newC);
 		  }
 		  C->eraseFromParent();
-		  goto done;
+
+		  return;
 		}
 	      }
 	    }
 	  }
 	}
       }
-
-    done: ;
       
     }
 
+    void replaceRealloc(Module& M) {
+      /* realloc(3) causes issues because it doesn't zero-initialize any additional memory.
+       * We can fix this by using Linux's malloc_usable_size(3) and then memset(3).
+       */
+      
+      auto& ctx = M.getContext();
+      
+      if (Function *F = M.getFunction("__clou_wrap_realloc")) {
+	// find call instruction
+	for (BasicBlock& B : *F) {
+	  for (Instruction& I : B) {
+	    if (CallInst *C = dyn_cast<CallInst>(&I)) {
+	      if (Function *callee = C->getCalledFunction()) {
+		if (callee->getName() == "realloc") {
+		  Type *I64 = Type::getInt64Ty(ctx);
+
+		  CallInst *reallocPointer = C;
+
+		  IRBuilder<> IRB (reallocPointer->getNextNode());
+
+
+		  // get declaration of malloc_usable_size()
+		  Function *malloc_usable_size_F = M.getFunction("malloc_usable_size");
+		  if (malloc_usable_size_F == nullptr) {
+		    std::vector<Type *> Ts = {Type::getInt8PtrTy(ctx)};
+		    FunctionType *malloc_usable_size_T = FunctionType::get(I64, Ts, false);
+		    malloc_usable_size_F = Function::Create(malloc_usable_size_T, Function::ExternalLinkage, "malloc_usable_size", M);
+		  }
+
+		  // get old size before call to realloc()
+		  CallInst *oldSize = IRBuilder<>(reallocPointer).CreateCall(malloc_usable_size_F,
+									     std::vector<Value *> {F->getArg(0)});
+		  CallInst *newSize = IRB.CreateCall(malloc_usable_size_F, std::vector<Value *> {reallocPointer});
+		  Value *sizeCmp = IRB.CreateICmpULT(oldSize, newSize);
+		  Value *sizeDiff = IRB.CreateSub(newSize, oldSize);
+		  Value *sizeDiffOrZero = IRB.CreateSelect(sizeCmp, sizeDiff, Constant::getNullValue(Type::getInt64Ty(ctx)));
+		  Value *gep = IRB.CreateInBoundsGEP(reallocPointer->getType()->getPointerElementType(), reallocPointer,
+						     std::vector<Value *> {oldSize});
+		  IRB.CreateMemSet(gep, Constant::getNullValue(Type::getInt8Ty(ctx)), sizeDiffOrZero, MaybeAlign(16));
+		  return;
+		}
+	      }
+	    }
+	  }
+	}
+      }
+    }
+      
     InlineAsm *makeFence(LLVMContext& ctx) {
       return InlineAsm::get(FunctionType::get(Type::getVoidTy(ctx), false), "lfence", "",
 			    false, InlineAsm::AD_Intel);
