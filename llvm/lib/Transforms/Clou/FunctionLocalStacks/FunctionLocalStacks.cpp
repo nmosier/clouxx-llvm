@@ -1,4 +1,5 @@
 #include <memory>
+#include <map>
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
@@ -137,9 +138,13 @@ namespace {
 		  IRBuilder<> IRB (C);
 		  std::vector<Value *> args = {F->getArg(0), ConstantInt::get(I64, 1)};
 		  CallInst *newC = IRB.CreateCall(callocF, args);
+#if 0
 		  for (User *U : C->users()) {
 		    U->replaceUsesOfWith(C, newC);
 		  }
+#else
+		  C->replaceAllUsesWith(newC);
+#endif
 		  C->eraseFromParent();
 
 		  return;
@@ -167,6 +172,7 @@ namespace {
       LLVMContext& ctx = wrapF.getContext();
       Module& M = *wrapF.getParent();
       CallInst *reallocPtr = findCallToFunction(wrapF, realName);
+      if (reallocPtr == nullptr) { errs() << wrapF << "\n"; }
       assert(reallocPtr != nullptr);
       IRBuilder<> preIRB (reallocPtr);
       IRBuilder<> postIRB (reallocPtr->getNextNode());
@@ -202,19 +208,52 @@ namespace {
       return wrapperName(F.getName());
     }
 
+    std::string wrapperName(Function& F, unsigned& counter) {
+      return "__clou_wrap" + std::to_string(counter++) + "_" + F.getName().str();
+    }
+
+    std::string nonVariadicName(Function& F) {
+      std::string name = F.getName().str();
+      std::string::iterator it;
+      for (it = name.begin(); it != name.end() && *it == '_'; ++it) {}
+      name.insert(it, 'v');
+      errs() << "non-variadic: " << name << "\n";
+      return name; 
+    }
+
+    static bool isUntyped(const Function& F) {
+      return F.isVarArg() && F.arg_size() == 0;
+    }
+
     void emitWrapperForDeclaration(Function& F) {
+      FunctionType *T = nullptr;
+      
       if (F.isIntrinsic()) {
 	return;
+      }
+
+      if (isUntyped(F)) {
+
+	errs() << "CLOU: warning: calls to untyped function \"" << F.getName() << "\" will not be mitigated\n";
+	return; 
+	
+      } else if (F.isVarArg()) {
+
+	emitWrappersForVarArgDecl(F);
+	return;
+	
       }
 
       Module& M = *F.getParent();
       auto& ctx = M.getContext();
 
       // emit weak function definition __clou_<funcname>
-      FunctionType *T = cast<FunctionType>(F.getType()->getPointerElementType());
+      if (T == nullptr) {
+	T = cast<FunctionType>(F.getType()->getPointerElementType());
+      }
       Function *newF = Function::Create(T, Function::LinkageTypes::WeakAnyLinkage, wrapperName(F), M);
       BasicBlock *B = BasicBlock::Create(ctx, "", newF);
-      IRBuilder<> IRB (B, B->begin());
+      IRBuilder<> IRB (B);
 
       // entering fence
       IRB.CreateCall(makeFence(ctx));
@@ -239,43 +278,291 @@ namespace {
       replaceUses(&F, newF);
     }
 
+    static const std::map<std::string, std::vector<std::function<Type * (LLVMContext&)>>> std_finite_varargs;
+
+    bool lookupFiniteVarArgFunc(Function& F, std::vector<Type *>& Ts) {
+      LLVMContext& ctx = F.getContext();
+
+      const auto it = std_finite_varargs.find(F.getName().str());
+      if (it == std_finite_varargs.end()) {
+	return false;
+      }
+      
+      std::transform(it->second.begin(), it->second.end(), std::back_inserter(Ts),
+		     [&ctx] (const auto& f) -> Type * {
+		       return f(ctx);
+		     });
+      return true;
+    }
+    
+
+    bool handleFiniteVarArgFunc(Function& F) {
+      assert(F.isDeclaration());
+
+      std::vector<Type *> Ts;
+      if (!lookupFiniteVarArgFunc(F, Ts)) {
+	return false;
+      }
+
+      Function *newF = emitWrapperForFiniteVarArgFunc(F, Ts);
+      
+      // replace uses of F with newF, and update calls
+      for (User *user : F.users()) {
+	if (CallInst *C = dyn_cast<CallInst>(user)) {
+	  IRBuilder<> IRB (C);
+	  std::vector<Value *> args;
+	  std::copy(C->arg_begin(), C->arg_end(), std::back_inserter(args));
+	  assert(F.arg_size() <= args.size());
+	  const int call_varargs = args.size() - F.arg_size();
+	  std::transform(Ts.begin() + call_varargs, Ts.end(), std::back_inserter(args), [] (Type *T) -> Constant * {
+	    return Constant::getNullValue(T);
+	  });
+	  CallInst *newC = IRB.CreateCall(newF, args);
+	  C->replaceAllUsesWith(newC);
+	  C->eraseFromParent();
+	} else {
+	  errs() << "finite vararg function used by a non-call instruction: " << *user << "\n";
+	  std::abort();
+	}
+      }
+
+      return true;
+    }
+
+    Function *emitWrapperForFiniteVarArgFunc(Function& F, const std::vector<Type *>& Ts) {
+      assert(F.isDeclaration());
+
+      Module& M = *F.getParent();
+      LLVMContext& ctx = F.getContext();
+
+      std::vector<Type *> arg_types;
+
+      FunctionType *T = cast<FunctionType>(F.getType()->getPointerElementType());
+
+      // always-present arguments 
+      for (Type *arg_type : T->params()) {
+	arg_types.push_back(arg_type);
+      }
+      
+      // variadic arguments
+      for (Type *arg_type : Ts) {
+	arg_types.push_back(arg_type);
+      }
+
+      // new function type
+      FunctionType *newT = FunctionType::get(T->getReturnType(), arg_types, false); // NOTE: no longer vararg
+      Function *newF = Function::Create(newT, Function::LinkageTypes::WeakAnyLinkage, wrapperName(F), M);
+      BasicBlock *B = BasicBlock::Create(ctx, "", newF);
+      IRBuilder<> IRB (B);
+
+      // entering fence
+      IRB.CreateCall(makeFence(ctx));
+
+      // call to external function
+      std::vector<Value *> args;
+      for (Argument& A : newF->args()) {
+	args.push_back(&A);
+      }
+      CallInst *C = IRB.CreateCall(T, &F, args);
+
+      // exiting fence
+      IRB.CreateCall(makeFence(ctx));
+
+      // return
+      if (C->getType()->isVoidTy()) {
+	IRB.CreateRetVoid();
+      } else {
+	IRB.CreateRet(C);
+      }
+
+      return newF;
+    }
+
+    void emitWrappersForVarArgDecl(Function& F) {
+      Module& M = *F.getParent();
+      LLVMContext& ctx = M.getContext();
+      
+      // collect types
+      std::map<std::vector<Type *>, std::vector<CallInst *>> sigs;
+      for (User *user : F.users()) {
+	if (CallInst *C = dyn_cast<CallInst>(user)) {
+	  std::vector<Type *> sig;
+	  for (Use& U : C->args()) {
+	    sig.push_back(U.get()->getType());
+	  }
+	  sigs[sig].push_back(C);
+	} else {
+	  errs() << "CLOU: warning: calls through the following value to the variadic function \"" << F.getName()
+		 << "\" will not be mitigated:\n" << *user << "\n";
+	}
+      }
+
+      // generate wrapper for each type
+      unsigned counter = 0;
+      for (const auto& sigp : sigs) {
+	const std::vector<Type *>& sig = sigp.first;
+	const std::vector<CallInst *>& calls = sigp.second;
+
+	// emit weak function definition
+	FunctionType *newT = FunctionType::get(F.getReturnType(), sig, false);
+	// TODO: need a different linkage if the vararg is static!
+	errs() << wrapperName(F, counter) << "\n";
+	Function *newF = Function::Create(newT, Function::LinkageTypes::WeakAnyLinkage, wrapperName(F, counter), M);
+	BasicBlock *B = BasicBlock::Create(ctx, "", newF);
+	IRBuilder<> IRB (B);
+
+	// TODO: Not sure if we really need fences here if there are <= 6 arguments.
+
+	// entering fence
+	IRB.CreateCall(makeFence(ctx));
+
+	// emit call
+	std::vector<Value *> args;
+	for (Argument& A : newF->args()) {
+	  args.push_back(&A);
+	}
+	Instruction *C = IRB.CreateCall(&F, args);
+
+	// exiting fence
+	IRB.CreateCall(makeFence(ctx));
+
+	// return
+	if (C->getType()->isVoidTy()) {
+	  IRB.CreateRetVoid();
+	} else {
+	  IRB.CreateRet(C);
+	}
+
+	// replace all calls w/ this signature to call our new wrapper
+	for (CallInst *call : calls) {
+	  call->setCalledFunction(newF);
+	}
+      }
+    }
+
+    #if 0
+    void emitWrapperForVarArgDecl(Function& F) {
+      Module& M = *F.getParent();
+      
+      // emit weak function definition
+      FunctionType *T = cast<FunctionType>(F.getType()->getPointerElementType());
+      Function *newF = Function::Create(T, Function::LinkageTypes::WeakAnyLinkage, wrapperName(F), M);
+      BasicBlock *B = BasicBlock::Create(ctx, "", newF);
+      IRBuilder<> IRB (B);
+
+      // entering fence
+      IRB.CreateCall(makeFence(ctx));
+
+      // get va-list version
+      auto oldFName = nonVariadicName(F);
+      assert(!oldFName.empty());
+      Function *nonVariadicF = M.getFunction(oldFName);
+      FunctionType *nonVariadicT;
+      StructType *vaListT;
+      if (nonVariadicF == nullptr) {
+	vaListT = StructType::create(std::vector<Type *> {
+	    Type::getInt32Ty(ctx), Type::getInt32Ty(ctx), Type::getInt8PtrTy(ctx), Type::getInt8PtrTy(ctx)
+	  }, "va_list");
+	std::vector<Type *> types;
+	std::copy(T->param_begin(), T->param_end(), std::back_inserter(types));
+	types.push_back(PointerType::getUnqual(vaListT));
+	nonVariadicT = FunctionType::get(T->getReturnType(), types, false);
+	nonVariadicF = Function::Create(nonVariadicT, Function::LinkageTypes::ExternalLinkage, oldFName, M);
+      } else {
+	nonVariadicT = cast<FunctionType>(nonVariadicF->getType()->getPointerElementType());
+	vaListT = cast<StructType>(nonVariadicT->params().back()->getPointerElementType());
+      }
+
+      Type *I8P = Type::getInt8PtrTy(ctx);
+
+      // allocate stack location for va_list
+      AllocaInst *vaListPtr = IRB.CreateAlloca(vaListT);
+
+      // call to intrinsic va_start
+      Value *vaListPtrI8P = IRB.CreateBitCast(vaListPtr, I8P);
+      IRB.CreateIntrinsic(Intrinsic::vastart, ArrayRef<Type *>(), std::vector<Value *> {vaListPtrI8P});
+      
+      // call to external function
+      std::vector<Value *> args;
+      for (Argument& A : newF->args()) {
+	args.push_back(&A);
+      }
+      args.push_back(vaListPtr);
+      errs() << "non-variadic F:\n" << *nonVariadicF << "\n";
+      errs() << "args:\n";
+      for (Value *V : args) { errs() << *V << "\n"; }
+      Instruction *C = IRB.CreateCall(cast<FunctionType>(nonVariadicF->getType()->getPointerElementType()), nonVariadicF, args);
+
+      // call to intrisic va_end
+      IRB.CreateIntrinsic(Intrinsic::vaend, ArrayRef<Type *>(), std::vector<Value *> {vaListPtrI8P});
+      
+      // exiting fence
+      IRB.CreateCall(makeFence(ctx));
+
+      // return
+      if (C->getType()->isVoidTy()) {
+	IRB.CreateRetVoid();
+      } else {
+	IRB.CreateRet(C);
+      }
+
+      replaceUses(&F, newF);
+    }
+#endif
+
     void emitAliasForDefinition(Function& F) {
       using L = GlobalAlias::LinkageTypes;
+      L linkage;
       switch (F.getLinkage()) {
       case L::ExternalLinkage:
+	linkage = L::ExternalLinkage;
+	break;
+
+      case L::WeakAnyLinkage:
+	linkage = L::WeakAnyLinkage;
 	break;
 	
       case L::InternalLinkage:
 	return;
 
       default:
-	errs() << getPassName() << ": " << __FUNCTION__ << ": unhandled linkage type: " << F.getLinkage() << " for function " << F.getName() << "\n";
+	errs() << getPassName() << ": " << __FUNCTION__ << ": unhandled linkage type: " << F.getLinkage()
+	       << " for function " << F.getName() << "\n";
 	std::abort();
       }
       
-      GlobalAlias::create(L::ExternalLinkage, wrapperName(F), &F);
+      GlobalAlias::create(linkage, wrapperName(F), &F);
       assert(F.getParent()->getNamedAlias(wrapperName(F).str()) != nullptr);
     }
 
     void replaceUses(Function *oldF, Function *newF) {
-      for (Use& U : oldF->uses()) {
-	User *user = U.getUser();
+      assert(newF->size() == 1);
 
-	if (Instruction *I = dyn_cast<Instruction>(user)) {
-	  if (I->getFunction() == newF) {
+      for (User *U : oldF->users()) {
+	if (CallInst *C = dyn_cast<CallInst>(U)) {
+	  if (C->getFunction() == newF) {
 	    continue;
 	  }
 	}
-
-	if (Constant *C = dyn_cast<Constant>(user)) {
+	
+	if (Constant *C = dyn_cast<Constant>(U)) {
 	  C->handleOperandChange(oldF, newF);
-	} else {
-	  user->replaceUsesOfWith(oldF, newF);
+	  continue;
 	}
+	
+	U->replaceUsesOfWith(oldF, newF);
       }
+      
+      // oldF->replaceUsesOutsideBlock(newF, &newF->getEntryBlock());
     }
 		       
   };
+
+
+  const std::map<std::string, std::vector<std::function<Type * (LLVMContext&)>>> FunctionLocalStacks::std_finite_varargs = {
+    {"open", {&Type::getInt32Ty}},
+  };
+  
 }
 
 char FunctionLocalStacks::ID = 0;
