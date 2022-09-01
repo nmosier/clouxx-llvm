@@ -17,9 +17,11 @@ namespace {
     static char ID;
     SecurityCallingConv(): FunctionPass(ID) {}
 
+    int num_fences;
+
     virtual bool runOnFunction(Function& F) override {
       bool changed = false;
-      
+
       // check number of arguments
       if (F.isVarArg() || F.arg_size() > num_arg_regs) {
 	// fence on entry
@@ -29,9 +31,20 @@ namespace {
 	InlineAsm *fence = InlineAsm::get(FunctionType::get(Type::getVoidTy(ctx), false), "lfence", "", false, InlineAsm::AD_Intel);
 	IRB.CreateCall(fence);
 	changed = true;
+	++num_fences;
       }
 
       return changed;
+    }
+
+    virtual bool doInitialization(Module&) override {
+      num_fences = 0;
+      return false;
+    }
+    
+    virtual bool doFinalization(Module&) override {
+      errs() << getPassName() << ": inserted " << num_fences << " fences\n";
+      return false;
     }
   };
 
