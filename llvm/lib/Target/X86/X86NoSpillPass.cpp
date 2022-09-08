@@ -1,0 +1,64 @@
+#include "X86.h"
+#include "X86InstrInfo.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/LiveIntervals.h"
+#include "llvm/Support/CommandLine.h"
+
+using namespace llvm;
+
+namespace llvm {
+    cl::opt<bool> enable_no_spill_pass("clou-nospill",
+				       cl::desc("Clou's No-spill Register Pass"),
+				       cl::init(false)
+				       );
+
+  namespace {
+
+
+    class X86NoSpillPass final: public MachineFunctionPass {
+    public:
+      inline static char ID = 0;
+      X86NoSpillPass(): MachineFunctionPass(ID) {
+	initializeX86NoSpillPassPass(*PassRegistry::getPassRegistry());
+      }
+
+      void getAnalysisUsage(AnalysisUsage& AU) const override {
+	AU.addRequired<LiveIntervals>();
+	AU.setPreservesAll();
+	MachineFunctionPass::getAnalysisUsage(AU);
+      }
+
+      bool runOnMachineFunction(MachineFunction& MF) override {
+	if (!enable_no_spill_pass) {
+	  return false;
+	}
+
+	LiveIntervals& LIS = getAnalysis<LiveIntervals>();
+
+	for (auto& MB : MF) {
+	  for (auto& MI : MB) {
+	    for (MachineOperand& MOP : MI.uses()) {
+	      if (MOP.isReg()) {
+		Register reg = MOP.getReg();
+		if (reg.isVirtual()) {
+		  LiveInterval& LI = LIS.getInterval(reg);
+		  LI.markNotSpillable();
+		}
+	      }
+	    }
+	  }
+	}
+
+	return false;
+      }
+    };
+
+  }
+  
+}
+    
+INITIALIZE_PASS(X86NoSpillPass, "clou-nospill", "Clou's No-spill Register Pass", false, false);
+
+namespace llvm {
+  FunctionPass *createX86NoSpillPassPass() { return new X86NoSpillPass(); }
+}
