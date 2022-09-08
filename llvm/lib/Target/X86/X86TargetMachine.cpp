@@ -47,7 +47,6 @@
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/CFGuard.h"
-#include "X86NoSpillPass.h"
 #include <memory>
 #include <string>
 
@@ -508,10 +507,6 @@ void X86PassConfig::addPreRegAlloc() {
 
   if (getOptLevel() != CodeGenOpt::None) {
     addPass(createX86PreTileConfigPass());
-  }
-
-  if (enable_no_spill_pass) {
-    addPass(createX86NoSpillPassPass());
   }
 }
 

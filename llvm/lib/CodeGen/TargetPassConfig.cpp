@@ -203,7 +203,7 @@ static cl::opt<bool> MISchedPostRA(
 
 // Experimental option to run live interval analysis early.
 static cl::opt<bool> EarlyLiveIntervals("early-live-intervals", cl::Hidden,
-    cl::desc("Run live interval analysis earlier in the pipeline"));
+					cl::desc("Run live interval analysis earlier in the pipeline"));
 
 // Experimental option to use CFL-AA in codegen
 static cl::opt<CFLAAType> UseCFLAA(
@@ -255,6 +255,10 @@ static cl::opt<bool> EnableMachineFunctionSplitter(
 static cl::opt<bool> DisableExpandReductions(
     "disable-expand-reductions", cl::init(false), cl::Hidden,
     cl::desc("Disable the expand reduction intrinsics pass from running"));
+
+namespace llvm {
+extern cl::opt<bool> ClouNoSpill;
+}
 
 /// Allow standard passes to be disabled by command line options. This supports
 /// simple binary flags that either suppress the pass or do nothing.
@@ -1446,8 +1450,10 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&PHIEliminationID);
 
   // Eventually, we want to run LiveIntervals before PHI elimination.
-  if (EarlyLiveIntervals)
+  if (EarlyLiveIntervals || ClouNoSpill) {
     addPass(&LiveIntervalsID);
+    addPass(&ClouNoSpillID);
+  }
 
   addPass(&TwoAddressInstructionPassID);
   addPass(&RegisterCoalescerID);
