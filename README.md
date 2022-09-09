@@ -3,7 +3,7 @@
 ## Building
 For developing:
 ```
-cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLVM_ENABLE_PROJECTS="clang" -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_ENABLE_ASSERTIONS=On ../llvm
+cmake -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DLLVM_ENABLE_PROJECTS="clang" -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_ENABLE_ASSERTIONS=On -DLLVM_BINUTILS_INCDIR=$(brew --prefix binutils)/include ../llvm
 ```
 
 # The LLVM Compiler Infrastructure
