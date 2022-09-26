@@ -316,6 +316,25 @@ bool RABasic::runOnMachineFunction(MachineFunction &mf) {
   RegAllocBase::init(getAnalysis<VirtRegMap>(),
                      getAnalysis<LiveIntervals>(),
                      getAnalysis<LiveRegMatrix>());
+
+#if 0
+  for (auto& MB : *MF) {
+    for (auto& MI : MB) {
+      for (auto& MO : MI.operands()) {
+	if (MO.isReg()) {
+	  Register reg = MO.getReg();
+	  if (reg.isVirtual()) {
+	    LiveInterval& LI = LIS->getInterval(reg);
+	    if (LI.isSpillable()) {
+	      errs() << "clou: live range shouldn't be spillable!\n";
+	    }
+	  }
+	}
+      }
+    }
+  }
+#endif
+  
   VirtRegAuxInfo VRAI(*MF, *LIS, *VRM, getAnalysis<MachineLoopInfo>(),
                       getAnalysis<MachineBlockFrequencyInfo>());
   VRAI.calculateSpillWeightsAndHints();

@@ -81,6 +81,7 @@ add_llvm_component_library(LLVMCodeGen
   LiveDebugVariables.cpp
   LiveIntervals.cpp
   ClouNoSpillPass.cpp
+  ClouNoSpillAnalysis.cpp
   LiveInterval.cpp
   LiveIntervalUnion.cpp
   LivePhysRegs.cpp

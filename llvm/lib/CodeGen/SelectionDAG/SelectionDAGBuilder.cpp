@@ -501,6 +501,9 @@ static void getCopyToParts(SelectionDAG &DAG, const SDLoc &DL, SDValue Val,
   assert(!ValueVT.isVector() && "Vector case handled elsewhere");
   EVT PartEVT = PartVT;
   if (PartEVT == ValueVT) {
+    if (NumParts != 1) {
+      errs() << *V << "\n";
+    }
     assert(NumParts == 1 && "No-op copy with multiple parts!");
     Parts[0] = Val;
     return;

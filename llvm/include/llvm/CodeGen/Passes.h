@@ -115,7 +115,8 @@ namespace llvm {
   /// and physical registers.
   extern char &LiveIntervalsID;
 
-  extern char &ClouNoSpillID;
+  extern char &ClouNoSpillAnalysisID;
+  extern char &ClouNoSpillPassID;
 
   /// LiveStacks pass. An analysis keeping track of the liveness of stack slots.
   extern char &LiveStacksID;

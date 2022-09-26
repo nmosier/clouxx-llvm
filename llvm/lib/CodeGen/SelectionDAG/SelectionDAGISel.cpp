@@ -414,6 +414,8 @@ static void computeUsesMSVCFloatingPoint(const Triple &TT, const Function &F,
 }
 
 bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
+  errs() << getPassName() << " " << mf.getName() << "\n";
+  
   // If we already selected that function, we do not need to run SDISel.
   if (mf.getProperties().hasProperty(
           MachineFunctionProperties::Property::Selected))

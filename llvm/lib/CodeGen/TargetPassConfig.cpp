@@ -1451,8 +1451,9 @@ void TargetPassConfig::addOptimizedRegAlloc() {
 
   // Eventually, we want to run LiveIntervals before PHI elimination.
   if (EarlyLiveIntervals || ClouNoSpill) {
+    // addPass(&ClouNoSpillAnalysisID);
     addPass(&LiveIntervalsID);
-    addPass(&ClouNoSpillID);
+    addPass(&ClouNoSpillPassID);
   }
 
   addPass(&TwoAddressInstructionPassID);

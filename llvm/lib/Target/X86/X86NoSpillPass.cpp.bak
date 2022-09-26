@@ -43,6 +43,10 @@ namespace llvm {
 		if (reg.isVirtual()) {
 		  LiveInterval& LI = LIS.getInterval(reg);
 		  LI.markNotSpillable();
+		  if (LI.isSpillable()) {
+		    errs() << "refused to be nospill\n";
+		    abort();
+		  }
 		}
 	      }
 	    }
