@@ -10,7 +10,4 @@ add_subdirectory(ObjCARC)
 add_subdirectory(Coroutines)
 add_subdirectory(CFGuard)
 
-# CLOU
-add_subdirectory(Clou)
-
 

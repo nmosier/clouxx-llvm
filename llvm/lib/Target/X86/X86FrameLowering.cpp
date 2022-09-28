@@ -2763,11 +2763,14 @@ void X86FrameLowering::determineCalleeSaves(MachineFunction &MF,
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
 
   // CLOU: force saves of r12-r15
+#if 0
+  // UPDATE 09/27/2022: Don't need to save these if we're assuming no regs are callee-saved.
   if (EnableFunctionLocalStacks) {
     for (const auto reg : std::array<unsigned, 4> {X86::R12, X86::R13, X86::R14, X86::R15}) {
       SavedRegs.set(reg);
     }
   }
+#endif
 
   // Spill the BasePtr if it's used.
   if (TRI->hasBasePointer(MF)){

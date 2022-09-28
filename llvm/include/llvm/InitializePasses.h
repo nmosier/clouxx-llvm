@@ -236,6 +236,7 @@ void initializeLiveDebugVariablesPass(PassRegistry&);
 void initializeLiveIntervalsPass(PassRegistry&);
 void initializeClouNoSpillPassPass(PassRegistry&);
 void initializeClouNoSpillAnalysisPass(PassRegistry&);
+void initializeClouMitigateSpillsPass(PassRegistry&);
 void initializeLiveRangeShrinkPass(PassRegistry&);
 void initializeLiveRegMatrixPass(PassRegistry&);
 void initializeLiveStacksPass(PassRegistry&);

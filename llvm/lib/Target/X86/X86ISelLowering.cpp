@@ -62,6 +62,7 @@
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetOptions.h"
+#include "X86FunctionLocalStacks.h"
 #include <algorithm>
 #include <bitset>
 #include <cctype>
@@ -4617,6 +4618,11 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
       Mask = RegInfo->getNoPreservedMask();
   }
 
+  // CLOU: EXPERIMENTAL
+  if (EnableFunctionLocalStacks) {
+    Mask = RegInfo->getNoPreservedMask();
+  }
+  
   // Define a new register mask from the existing mask.
   uint32_t *RegMask = nullptr;
 

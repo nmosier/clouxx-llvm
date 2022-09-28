@@ -51,6 +51,8 @@
 #include <cassert>
 #include <string>
 
+#include "llvm/CodeGen/ClouMitigateSpills.h"
+
 using namespace llvm;
 
 static cl::opt<bool>
@@ -1504,6 +1506,11 @@ void TargetPassConfig::addMachineLateOptimization() {
 
   // Copy propagation.
   addPass(&MachineCopyPropagationID);
+
+  // CLOU: Mitigate spills
+  if (ClouMitigateSpillsFlag) {
+    addPass(&ClouMitigateSpillsID);
+  }
 }
 
 /// Add standard GC passes.
