@@ -80,6 +80,7 @@ add_llvm_component_library(LLVMCodeGen
   LexicalScopes.cpp
   LiveDebugVariables.cpp
   LiveIntervals.cpp
+  Clou.cpp
   ClouNoSpillPass.cpp
   ClouNoSpillAnalysis.cpp
   ClouMitigateSpills.cpp

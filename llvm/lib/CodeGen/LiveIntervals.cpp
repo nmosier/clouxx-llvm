@@ -124,8 +124,6 @@ void LiveIntervals::releaseMemory() {
 }
 
 bool LiveIntervals::runOnMachineFunction(MachineFunction &fn) {
-  errs() << "LiveIntervals: " << fn.getName() << "\n";
-  
   MF = &fn;
   MRI = &MF->getRegInfo();
   TRI = MF->getSubtarget().getRegisterInfo();

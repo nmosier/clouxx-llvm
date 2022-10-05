@@ -12,19 +12,11 @@
 #include "llvm/CodeGen/ClouNoSpillAnalysis.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 
+#include "llvm/Clou/Clou.h"
 
 using namespace llvm;
 
 namespace llvm {
-    cl::opt<bool> ClouNoSpill("clou-nospill",
-			      cl::desc("Clou's No-spill Register Pass"),
-			      cl::init(false)
-			      );
-
-  cl::opt<int> ClouNoSpillMax("clou-nospill-max",
-			      cl::desc("Maximum register to mark nospill per function (negative number means unlimited)"),
-			      cl::init(-1)
-			      );
 
   // TODO: Can remove this when compiling without MinSizeRel.
   raw_os_ostream placeholder (std::cerr);

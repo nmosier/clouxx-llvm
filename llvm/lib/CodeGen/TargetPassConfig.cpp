@@ -52,6 +52,7 @@
 #include <string>
 
 #include "llvm/CodeGen/ClouMitigateSpills.h"
+#include "llvm/Clou/Clou.h"
 
 using namespace llvm;
 
@@ -257,10 +258,6 @@ static cl::opt<bool> EnableMachineFunctionSplitter(
 static cl::opt<bool> DisableExpandReductions(
     "disable-expand-reductions", cl::init(false), cl::Hidden,
     cl::desc("Disable the expand reduction intrinsics pass from running"));
-
-namespace llvm {
-extern cl::opt<bool> ClouNoSpill;
-}
 
 /// Allow standard passes to be disabled by command line options. This supports
 /// simple binary flags that either suppress the pass or do nothing.
@@ -1452,7 +1449,7 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   addPass(&PHIEliminationID);
 
   // Eventually, we want to run LiveIntervals before PHI elimination.
-  if (EarlyLiveIntervals || ClouNoSpill) {
+  if (EarlyLiveIntervals || clou::ClouNoSpill) {
     // addPass(&ClouNoSpillAnalysisID);
     addPass(&LiveIntervalsID);
     addPass(&ClouNoSpillPassID);
