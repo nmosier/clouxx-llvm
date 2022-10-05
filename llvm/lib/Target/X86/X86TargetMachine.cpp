@@ -588,8 +588,6 @@ void X86PassConfig::addPreEmitPass2() {
   }
   addPass(createX86LoadValueInjectionRetHardeningPass());
 
-  addPass(createX86ReloadSPPass());
-
   // Insert pseudo probe annotation for callsite profiling
   addPass(createPseudoProbeInserter());
 

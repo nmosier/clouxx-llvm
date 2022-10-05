@@ -84,7 +84,6 @@ set(sources
   X86WinEHState.cpp
   X86InsertWait.cpp
   X86FunctionLocalStacks.cpp
-  X86ReloadSP.cpp
   )
 
 add_llvm_target(X86CodeGen ${sources}
