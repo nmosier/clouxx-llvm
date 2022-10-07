@@ -4,6 +4,7 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "X86Subtarget.h"
 #include "llvm/IR/Module.h"
+#include "llvm/CodeGen/LiveIntervals.h"
 
 using namespace llvm;
 
@@ -26,7 +27,7 @@ namespace {
       initializeX86FunctionLocalStacksPass(*PassRegistry::getPassRegistry());
     }
 
-    virtual bool runOnMachineFunction(MachineFunction& MF) override {
+    bool runOnMachineFunction(MachineFunction& MF) override {
       if (!EnableFunctionLocalStacks) {
 	return false;
       }
@@ -34,6 +35,7 @@ namespace {
       const TargetInstrInfo *TII = MF.getSubtarget<X86Subtarget>().getInstrInfo();
       const Function& F = MF.getFunction();
       const GlobalValue *sp = MF.getFunction().getParent()->getNamedValue((F.getName() + "_sp").str());
+      const TargetRegisterInfo& TRI = *MF.getSubtarget().getRegisterInfo();
       assert(sp != nullptr);
 
       for (auto& MBB : MF) {
@@ -54,6 +56,40 @@ namespace {
 								   Align(8)))
 	      .addReg(X86::RSP);
 
+
+	    // Zero out any unused parameter-passing registers
+	    for (const auto param_gpr : std::array<MCPhysReg, 6> {X86::EDI, X86::ESI, X86::EDX, X86::ECX, X86::R8D, X86::R9D}) {
+	      if (none_of(llvm::concat<MachineOperand>(MBBI->operands(), MBBI->implicit_operands()), [&] (const MachineOperand& MO) {
+		if (MO.isReg()) {
+		  return TRI.regsOverlap(param_gpr, MO.getReg());
+		} else {
+		  return false;
+		}
+	      })) {
+		// zero it out
+		BuildMI(MBB, MBBI, DL, TII->get(X86::XOR32rr), param_gpr)
+		  .addReg(param_gpr)
+		  .addReg(param_gpr);
+	      }
+	    }
+
+#if 0
+	    std::array<MCPhysReg, 8> param_fps = {X86::XMM0, X86::XMM1, X86::XMM2, X86::XMM3, X86::XMM4, X86::XMM5, X86::XMM6, X86::XMM7};
+	    if (any_of(param_fps, [&] (const MCPhysReg& reg) {
+	      return MBBI->killsRegister(reg);
+	    })) {
+	      for (const auto reg : param_fps) {
+		if (!MBBI->killsRegister(reg)) {
+		  BuildMI(MBB, MBBI, DL, TII->get(X86::XORPSrr), reg)
+		    .addReg(reg)
+		    .addReg(reg);
+		}
+	      }
+	    } else {
+	      BuildMI(MBB, MBBI, DL, TII->get(X86::VZEROALL));	      
+	    }
+#endif
+
 	    const auto MBBI_next = std::next(MBBI);
 	    if (MBBI_next != MBB.end()) {
 	      // Check if SP is correct -- Spectre RSB hardening
@@ -62,9 +98,9 @@ namespace {
 	      // cmovne rsp, rdi
 	      // cmovne rbp, rdi
 	      // cmovne rbx, rdi
-	      BuildMI(MBB, MBBI_next, DL, TII->get(X86::XOR64rr), X86::RDI)
-		.addReg(X86::RDI)
-		.addReg(X86::RDI);
+	      BuildMI(MBB, MBBI_next, DL, TII->get(X86::XOR32rr), X86::EDI)
+		.addReg(X86::EDI)
+		.addReg(X86::EDI);
 #if 1
 	      BuildMI(MBB, MBBI_next, DL, TII->get(X86::CMP64rm))
 		.addReg(X86::RSP)
@@ -95,6 +131,10 @@ namespace {
 #if 0
       // set callee-saved regs
       static const MCPhysReg csrs[] = {X86::RBX, X86::R12, X86::R13, X86::R14, X86::R15};
+      MF.getRegInfo().setCalleeSavedRegs(csrs);
+#else
+      // well, save the base pointer at least
+      static const MCPhysReg csrs[] = {X86::RBX};
       MF.getRegInfo().setCalleeSavedRegs(csrs);
 #endif
       
