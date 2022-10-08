@@ -62,7 +62,7 @@
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Target/TargetOptions.h"
-#include "X86FunctionLocalStacks.h"
+#include "llvm/Clou/Clou.h"
 #include <algorithm>
 #include <bitset>
 #include <cctype>
@@ -4619,7 +4619,7 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   }
 
   // CLOU: EXPERIMENTAL
-  if (EnableFunctionLocalStacks) {
+  if (clou::enabled.fps) {
     Mask = RegInfo->getNoPreservedMask();
   }
   

@@ -10,20 +10,6 @@
 
 namespace clou {
 
-  StackMitigationMode stack_mitigation_mode;
-  namespace {
-    llvm::cl::opt<StackMitigationMode, true> stack_mitigation_mode_opt {
-      "clou-stack-mitigation",
-      llvm::cl::location(stack_mitigation_mode),
-      llvm::cl::desc("Stack mitigation mode"),
-      llvm::cl::values(clEnumValN(StackMitigationMode::Lfence, "lfence", "Mitigate stacks with lfence"),
-		       clEnumValN(StackMitigationMode::FunctionPrivateStacks, "function-private-stacks", "Mitigate stacks with function-private stacks"),
-		       clEnumValN(StackMitigationMode::FunctionPrivateStacks, "fps", "Mitigation stacks with function-private stacks")
-		       ),
-      llvm::cl::init(StackMitigationMode::Lfence),
-    };
-  }
-
   bool ClouNoSpill;
   namespace {
     llvm::cl::opt<bool, true> ClouNoSpillFlag("clou-nospill",
@@ -31,22 +17,6 @@ namespace clou {
 					      llvm::cl::location(ClouNoSpill),
 					      llvm::cl::init(false)
 					      );
-  }
-
-  bool ClouSpectreRSB;
-  namespace {
-    llvm::cl::opt<bool, true> ClouSpectreRSBFlag("clou-rsb",
-						 llvm::cl::desc("Protect against Spectre RSB"),
-						 llvm::cl::location(ClouSpectreRSB),
-						 llvm::cl::init(false),
-						 llvm::cl::callback([] (const bool& value) {
-						   if (value && stack_mitigation_mode != StackMitigationMode::FunctionPrivateStacks) {
-						     llvm::WithColor::error() << "--clou-rsb flag passed without first enabling function-private stacks "
-									      << "with --clou-stack-mitigation=fps\n";
-						     std::exit(EXIT_FAILURE);
-						   }
-						 })
-						 );
   }
 
   bool ClouLog = false;
@@ -87,6 +57,12 @@ namespace clou {
 	}
       }
     }
+
+    // Validity checks
+    if (postch && !fps) {
+      llvm::WithColor::error() << ": post-call hardening ('postch') requires function-private stacks ('fps') to be enabled\n";
+      std::_Exit(EXIT_FAILURE);
+    }
   }
 
   Subcomponents enabled;
@@ -96,6 +72,8 @@ namespace clou {
     llvm::cl::opt<std::string> ClouOpt {
       "clou",
       llvm::cl::desc("Enable LLVM-SCT a.k.a. ClouCC"),
+      llvm::cl::ValueOptional,
+      llvm::cl::ZeroOrMore,
       llvm::cl::callback([] (const std::string& s) {
 	enabled = Subcomponents(s);
       }),

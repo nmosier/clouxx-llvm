@@ -7,15 +7,8 @@
 #include "llvm/ADT/StringRef.h"
 
 namespace clou {
-
-  enum class StackMitigationMode {
-    FunctionPrivateStacks,
-    Lfence,
-  };
-  extern StackMitigationMode stack_mitigation_mode;
-
+  
   extern bool ClouNoSpill;
-  extern bool ClouSpectreRSB;
   extern bool ClouLog;
   extern std::string ClouLogDir;
 

@@ -32,7 +32,7 @@
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Target/TargetOptions.h"
-#include "X86FunctionLocalStacks.h"
+#include "llvm/Clou/Clou.h"
 #include <cstdlib>
 
 #define DEBUG_TYPE "x86-fl"
@@ -1698,7 +1698,7 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
   }
 
   // CLOU: load function-local stack
-  if (EnableFunctionLocalStacks) {
+  if (clou::enabled.fps) {
     const Function& F = MF.getFunction();
     const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
     BuildMI(MBB, MBBI, DL, TII.get(X86::MOV64rm), X86::RSP)
@@ -2213,7 +2213,7 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
   // realigned. Don't do this if this was a funclet epilogue, since the funclets
   // will not do realignment or dynamic stack allocation.
   if ((((TRI->hasStackRealignment(MF)) || MFI.hasVarSizedObjects()) &&
-       !IsFunclet) || EnableFunctionLocalStacks) {
+       !IsFunclet) || clou::enabled.fps) {
     if (TRI->hasStackRealignment(MF))
       MBBI = FirstCSPop;
     unsigned SEHFrameOffset = calculateSetFPREG(SEHStackAllocAmt);
@@ -2761,16 +2761,6 @@ void X86FrameLowering::determineCalleeSaves(MachineFunction &MF,
                                             BitVector &SavedRegs,
                                             RegScavenger *RS) const {
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
-
-  // CLOU: force saves of r12-r15
-#if 0
-  // UPDATE 09/27/2022: Don't need to save these if we're assuming no regs are callee-saved.
-  if (EnableFunctionLocalStacks) {
-    for (const auto reg : std::array<unsigned, 4> {X86::R12, X86::R13, X86::R14, X86::R15}) {
-      SavedRegs.set(reg);
-    }
-  }
-#endif
 
   // Spill the BasePtr if it's used.
   if (TRI->hasBasePointer(MF)){

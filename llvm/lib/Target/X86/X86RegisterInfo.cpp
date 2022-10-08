@@ -33,7 +33,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "X86FunctionLocalStacks.h"
+#include "llvm/Clou/Clou.h"
 
 using namespace llvm;
 
@@ -640,14 +640,14 @@ void X86RegisterInfo::adjustStackMapLiveOutMask(uint32_t *Mask) const {
 //===----------------------------------------------------------------------===//
 
 static bool CantUseSP(const MachineFrameInfo &MFI) {
-  if (EnableFunctionLocalStacks)
+  if (clou::enabled.fps)
     return true;
 
   return MFI.hasVarSizedObjects() || MFI.hasOpaqueSPAdjustment();
 }
 
 bool X86RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
-  if (EnableFunctionLocalStacks)
+  if (clou::enabled.fps)
     return true;
   
   const X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
