@@ -5,6 +5,7 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Function.h"
 
 namespace clou {
   
@@ -23,7 +24,14 @@ namespace clou {
   };
 
   extern Subcomponents enabled;
-  
+
+  extern bool whitelisted(const llvm::Function& F);
+
+  extern size_t max_inline_instructions;
+  extern size_t max_inline_count;
+
+  extern bool UnsafeAA;
+  extern bool WeightGraph;
 }
 
 #endif

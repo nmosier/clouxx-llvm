@@ -95,6 +95,12 @@ STATISTIC(NumAggregatesPromoted, "Number of aggregate arguments promoted");
 STATISTIC(NumByValArgsPromoted, "Number of byval arguments promoted");
 STATISTIC(NumArgumentsDead, "Number of dead pointer args eliminated");
 
+static cl::opt<bool> DisableArgumentPromotion {
+  "no-promote-arguments",
+  cl::desc("Do not promote arguments (disable Argument Promotion pass)"),
+  cl::init(false),
+};
+
 /// A vector used to hold the indices of a single GEP instruction
 using IndicesVector = std::vector<uint64_t>;
 
@@ -1129,6 +1135,9 @@ Pass *llvm::createArgumentPromotionPass(unsigned MaxElements) {
 
 bool ArgPromotion::runOnSCC(CallGraphSCC &SCC) {
   if (skipSCC(SCC))
+    return false;
+
+  if (DisableArgumentPromotion)
     return false;
 
   // Get the callgraph information that we need to update to reflect our

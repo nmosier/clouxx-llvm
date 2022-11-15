@@ -3,6 +3,7 @@
 #include <string>
 #include <map>
 #include <cstdlib>
+#include <set>
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/WithColor.h"
@@ -80,5 +81,56 @@ namespace clou {
     };
     
   }
-  
+
+  namespace {
+    std::set<std::string> whitelist;
+    llvm::cl::opt<std::string> ClouWhitelistOpt {
+      "clou-whitelist",
+      llvm::cl::desc("Whitelist function(s)"),
+      llvm::cl::ZeroOrMore,
+      llvm::cl::callback([] (const std::string& s) {
+	llvm::SmallVector<llvm::StringRef> tokens;
+	llvm::StringRef(s).split(tokens, ',');
+	for (llvm::StringRef token : tokens)
+	  whitelist.insert(token.str());
+      })
+    };
+  }
+
+  bool whitelisted(const llvm::Function& F) {
+    return whitelist.find(F.getName().str()) != whitelist.end();
+  }
+
+  size_t max_inline_instructions;
+  static llvm::cl::opt<size_t, true> ClouMaxInlineInsts {
+    "clou-max-inline-insts",
+    llvm::cl::desc("Maximum number of instructions for which we'll inline a function"),
+    llvm::cl::location(max_inline_instructions),
+    llvm::cl::init(100),
+  };
+
+  size_t max_inline_count;
+  static llvm::cl::opt<size_t, true> ClouMaxInlineCount {
+    "clou-max-inline-count",
+    llvm::cl::desc("Maximum number of times we'll inline a function"),
+    llvm::cl::location(max_inline_count),
+    llvm::cl::init(2),
+  };
+
+  bool UnsafeAA;
+  static llvm::cl::opt<bool, true> UnsafeAliasAnalysisFlag {
+    "clou-unsafe-aa",
+    llvm::cl::desc("Use an optimistic, unsafe alias analysis (only use for testing!)"),
+    llvm::cl::location(UnsafeAA),
+    llvm::cl::init(false),
+  };
+
+  bool WeightGraph;
+  static llvm::cl::opt<bool, true> WeightGraphFlag {
+    "clou-weight",
+    llvm::cl::desc("Weight the s-t graph"),
+    llvm::cl::location(WeightGraph),
+    llvm::cl::init(true),
+  };
+    
 }

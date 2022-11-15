@@ -59,6 +59,11 @@
 #include <iterator>
 #include <utility>
 
+#include <fstream>
+#include <string>
+#include "llvm/Clou/Clou.h"
+#include "llvm/Support/raw_os_ostream.h"
+
 using namespace llvm;
 
 #define PASS_KEY "x86-slh"
@@ -74,6 +79,23 @@ STATISTIC(NumCallsOrJumpsHardened,
           "Number of calls or jumps requiring extra hardening");
 STATISTIC(NumInstsInserted, "Number of instructions inserted");
 STATISTIC(NumLFENCEsInserted, "Number of lfence instructions inserted");
+
+static unsigned SctNumMitigations;
+
+struct PrintNumMitigations {
+  llvm::StringRef name;
+  PrintNumMitigations(llvm::StringRef name): name(name) { SctNumMitigations = 0; }
+  ~PrintNumMitigations() {
+    if (clou::ClouLog) {
+      std::string s;
+      llvm::raw_string_ostream ss(s);
+      ss << clou::ClouLogDir << "/mitigations.tab";
+      std::ofstream ofs (s, std::ios::app);
+      llvm::raw_os_ostream os(ofs);
+      os << name << " " << SctNumMitigations << "\n";
+    }
+  }
+};
 
 static cl::opt<bool> EnableSpeculativeLoadHardening(
     "x86-speculative-load-hardening",
@@ -399,6 +421,8 @@ bool X86SpeculativeLoadHardeningPass::runOnMachineFunction(
     MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "********** " << getPassName() << " : " << MF.getName()
                     << " **********\n");
+
+  PrintNumMitigations print_num_mitigations(MF.getName());
 
   // Only run if this pass is forced enabled or we detect the relevant function
   // attribute requesting SLH.
@@ -1763,6 +1787,7 @@ void X86SpeculativeLoadHardeningPass::hardenLoadAddr(
     AddrRegToHardenedReg[Op->getReg()] = TmpReg;
     Op->setReg(TmpReg);
     ++NumAddrRegsHardened;
+    ++SctNumMitigations;
   }
 
   // And restore the flags if needed.
@@ -1981,6 +2006,7 @@ unsigned X86SpeculativeLoadHardeningPass::hardenPostLoad(MachineInstr &MI) {
   MRI->replaceRegWith(/*FromReg*/ OldDefReg, /*ToReg*/ HardenedReg);
 
   ++NumPostLoadRegsHardened;
+  ++SctNumMitigations;
   return HardenedReg;
 }
 
@@ -2265,6 +2291,7 @@ void X86SpeculativeLoadHardeningPass::hardenIndirectCallOrJumpInstr(
   TargetOp.setReg(HardenedTargetReg);
 
   ++NumCallsOrJumpsHardened;
+  ++SctNumMitigations;
 }
 
 INITIALIZE_PASS_BEGIN(X86SpeculativeLoadHardeningPass, PASS_KEY,
