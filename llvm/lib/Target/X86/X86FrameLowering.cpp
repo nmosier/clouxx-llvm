@@ -40,6 +40,8 @@
 STATISTIC(NumFrameLoopProbe, "Number of loop stack probes used in prologue");
 STATISTIC(NumFrameExtraProbe,
           "Number of extra stack probes generated in prologue");
+STATISTIC(FPSNumMitigations, "Number of mitigations inserted by function-private stacks");
+STATISTIC(FPSNumInstructions, "Number of instructions inserted by function-private stacks");
 
 using namespace llvm;
 
@@ -1701,18 +1703,23 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
   if (clou::enabled.fps) {
     const Function& F = MF.getFunction();
     const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
-    BuildMI(MBB, MBBI, DL, TII.get(X86::MOV64rm), X86::RSP)
-      .addReg(X86::RIP)
+    const unsigned AddrBytes = Is64Bit ? 8 : 4;
+    const Align AddrAlign(AddrBytes);
+    BuildMI(MBB, MBBI, DL, TII.get(Is64Bit ? X86::MOV64rm : X86::MOV32rm), Is64Bit ? X86::RSP : X86::ESP)
+      .addReg(Is64Bit ? X86::RIP : X86::NoRegister)
       .addImm(1)
       .addReg(X86::NoRegister)
       .addGlobalAddress(sp, 0)
       .addReg(X86::NoRegister)
-      .addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp),
-					     MachineMemOperand::MOLoad,
-					     8,
-					     Align(8)));
+      .addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp), MachineMemOperand::MOLoad, AddrBytes,
+					     AddrAlign));
+    ++FPSNumInstructions;
+    ++FPSNumMitigations;
     constexpr int64_t padding = 64;
     emitSPUpdate(MBB, MBBI, DL, -padding, false);
+
+    if (clou::InsertTrapAfterMitigations)
+      BuildMI(MBB, MBBI, DL, TII.get(X86::MFENCE));
   }
 
   // Realign stack after we pushed callee-saved registers (so that we'll be

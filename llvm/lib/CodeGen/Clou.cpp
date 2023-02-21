@@ -24,30 +24,43 @@ namespace clou {
   std::string ClouLogDir;
   namespace {
     llvm::cl::opt<std::string, true> ClouLogDirOpt("clou-log",
-						    llvm::cl::desc("Clou's Logging Directory"),
-						    llvm::cl::location(ClouLogDir),
-						    llvm::cl::callback([] (const std::string& s) {
-						      ClouLog = !s.empty();
-						    }));
+						   llvm::cl::desc("Clou's Logging Directory"),
+						   llvm::cl::location(ClouLogDir),
+						   llvm::cl::ZeroOrMore,
+						   llvm::cl::callback([] (const std::string& s) {
+						     ClouLog = !s.empty();
+						   }));
   }
 
+  bool PSF = false;
+  static llvm::cl::opt<bool, true> PSFFlag("clou-psf",
+					  llvm::cl::desc("Clou PSF (experimental)"),
+					  llvm::cl::location(PSF),
+					  llvm::cl::init(false)
+					  );
 
-  Subcomponents::Subcomponents(): udt(false), oobs(false), fps(false), prech(false), postch(false) {}
+#define SUBCOMPONENTS_INIT_Y(name, init) name(false)
+#define SUBCOMPONENTS_INIT_X(name, init) SUBCOMPONENTS_INIT_Y(name, init),
+  Subcomponents::Subcomponents(): SUBCOMPONENTS_X(SUBCOMPONENTS_INIT_X, SUBCOMPONENTS_INIT_Y) {}
+#undef SUBCOMPONENTS_INIT_X
+#undef SUBCOMPONENTS_INIT_Y
   Subcomponents::Subcomponents(llvm::StringRef s): Subcomponents() {
     if (s == "" || s == "all") {
-      udt = oobs = fps = prech = postch = true;
+#define SUBCOMPONENTS_ASSIGN(name, init) name = init;
+      SUBCOMPONENTS_X(SUBCOMPONENTS_ASSIGN, SUBCOMPONENTS_ASSIGN);
+#undef SUBCOMPONENTS_ASSIGN
     } else if (s == "none") {
-      // ignore
+#define SUBCOMPONENTS_ASSIGN(name, init) name = false;
+      SUBCOMPONENTS_X(SUBCOMPONENTS_ASSIGN, SUBCOMPONENTS_ASSIGN);
+#undef SUBCOMPONENTS_ASSIGN
     } else {
       llvm::SmallVector<llvm::StringRef> tokens;
       s.split(tokens, ",");
       for (llvm::StringRef token : tokens) {
 	static const std::map<std::string, bool Subcomponents::*> map = {
-	  {"udt", &Subcomponents::udt},
-	  {"oobs", &Subcomponents::oobs},
-	  {"fps", &Subcomponents::fps},
-	  {"prech", &Subcomponents::prech},
-	  {"postch", &Subcomponents::postch},
+#define SUBCOMPONENTS_TAB(name, init) {#name, &Subcomponents::name},
+	  SUBCOMPONENTS_X(SUBCOMPONENTS_TAB, SUBCOMPONENTS_TAB)
+#undef SUBCOMPONENTS_TAB
 	};
 	const auto it = map.find(token.str());
 	if (it == map.end()) {
@@ -132,5 +145,56 @@ namespace clou {
     llvm::cl::location(WeightGraph),
     llvm::cl::init(true),
   };
-    
+
+  bool InsertTrapAfterMitigations;
+  static llvm::cl::opt<bool, true> InsertTrapAfterMitigationsFlag {
+    "clou-mitigation-trap",
+    llvm::cl::desc("Insert a trap after each mitigation; used for dynamic mitigation counting"),
+    llvm::cl::location(InsertTrapAfterMitigations),
+    llvm::cl::init(false),
+  };
+
+  MinCutAlgKind MinCutAlg;
+  static llvm::cl::opt<MinCutAlgKind, true> MinCutAlgKindOpt {
+    "clou-min-cut-alg",
+    llvm::cl::desc("Which minimum directed multi-cut algorithm to use"),
+    llvm::cl::values(clEnumValN(MinCutAlgKind::SMT, "smt", "Use a SMT solver"),
+		     clEnumValN(MinCutAlgKind::GREEDY, "greedy", "Use a greedy algorithm")
+		     ),
+    llvm::cl::location(MinCutAlg),
+    llvm::cl::init(MinCutAlgKind::GREEDY),
+  };
+
+  bool RestrictedPSF;
+  static llvm::cl::opt<bool, true> RestrictedPSFFlag {
+    "clou-restricted-psf",
+    llvm::cl::desc("Restricted PSF mode: only protect against PSF in LSQ (only makes sense with '-clou-psf' flag)"),
+    llvm::cl::location(RestrictedPSF),
+    llvm::cl::init(true),
+  };
+
+  float LoopWeight;
+  static llvm::cl::opt<float, true> LoopWeight_ {
+    "clou-loop-weight",
+    llvm::cl::desc("Loop weight in LFENCE Insertion Pass"),
+    llvm::cl::location(LoopWeight),
+    llvm::cl::init(1)
+  };
+
+  float DominatorWeight;
+  static llvm::cl::opt<float, true> DominatorWeight_ {
+    "clou-dom-weight",
+    llvm::cl::desc("Dominator weight in LFENCE Insertion Pass"),
+    llvm::cl::location(DominatorWeight),
+    llvm::cl::init(1)
+  };
+
+  float STWeight;
+  static llvm::cl::opt<float, true> STWeight_ {
+    "clou-st-weight",
+    llvm::cl::desc("ST pair weight in LFENCE Insertion Pass"),
+    llvm::cl::location(STWeight),
+    llvm::cl::init(1)
+  };
+  
 }
