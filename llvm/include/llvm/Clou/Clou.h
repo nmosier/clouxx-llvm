@@ -62,6 +62,11 @@ namespace clou {
   extern float LoopWeight;
   extern float DominatorWeight;
   extern float STWeight;
+
+  extern bool ExpandSTs;
+
+  extern llvm::StringRef FnAttr_fps_usestack;
+  extern const uint64_t StackSize;
 }
 
 #endif

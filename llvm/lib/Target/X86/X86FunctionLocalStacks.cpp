@@ -30,6 +30,42 @@ namespace {
       });
     }
 
+    static bool shouldSaveSP(MachineInstr& MI, const X86RegisterInfo& TRI) {
+      assert(MI.isCall());
+      MachineFunction *MF = MI.getParent()->getParent();
+      if (TRI.hasBasePointer(*MF))
+	return true;
+
+      for (auto& MBB : *MF)
+	for (auto& MI : MBB) 
+	  if (MI.getOpcode() == X86::ADJCALLSTACKUP64 && MI.getOperand(0).getImm() > 0)
+	    return true;
+
+      return false;
+    }
+
+    static bool shouldHardenUnusedArgs(MachineInstr& Call) {
+      assert(Call.isCall());
+
+      switch (Call.getOpcode()) {
+      case X86::CALLpcrel32:
+	{
+	  const auto& CalleeOp = Call.getOperand(0);
+	  assert(CalleeOp.isGlobal());
+	  auto *GV = CalleeOp.getGlobal();
+	  const Function *CalledF = cast<Function>(GV);
+	  if (CalledF->hasLocalLinkage())
+	    return false;
+	}
+	break;
+	
+      default:
+	break;
+      }
+
+      return true;
+    }
+
     bool runOnMachineFunction(MachineFunction& MF) override {
       if (!clou::enabled.fps && !clou::enabled.prech && !clou::enabled.postch) {
 	return false;
@@ -41,12 +77,19 @@ namespace {
       const unsigned AddrBytes = Is64Bit ? 8 : 4;
       const Align AddrAlign(AddrBytes);
       const Function& F = MF.getFunction();
-      const GlobalValue *sp;
+      const GlobalValue *stack = nullptr;
+      const GlobalValue *sp = nullptr;
+      const bool mayRecurse = !F.doesNotRecurse();
+      const Module& M = *F.getParent();
       if (clou::enabled.fps) {
-	sp = MF.getFunction().getParent()->getNamedValue((F.getName() + "_sp").str());
-	assert(sp != nullptr);
+	if (mayRecurse || true) {
+	  sp = M.getNamedValue((F.getName() + "_sp").str());
+	  assert(sp && "Stack pointer not found for function that may recurse!");
+	}
+	stack = M.getNamedValue((F.getName() + "_stack").str());
+	assert(stack && "Stack not found for function!");
       }
-      const TargetRegisterInfo& TRI = *MF.getSubtarget().getRegisterInfo();
+      const auto& TRI = *MF.getSubtarget<X86Subtarget>().getRegisterInfo();
 
       for (auto& MBB : MF) {
 	for (auto MBBI = MBB.begin(); MBBI != MBB.end(); ++MBBI) {
@@ -54,23 +97,23 @@ namespace {
 	    const auto& DL = MBBI->getDebugLoc();
 
 	    if (clou::enabled.fps) {
-	      // store SP right before
-	      // if (!MF.getFunction().doesNotRecurse())
-	      BuildMI(MBB, MBBI, DL, TII->get(Is64Bit ? X86::MOV64mr : X86::MOV32mr))
-		.addReg(Is64Bit ? X86::RIP : X86::NoRegister)
-		.addImm(1)
-		.addReg(0)
-		.addGlobalAddress(sp, 0)
-		.addReg(0)
-		.addReg(Is64Bit ? X86::RSP : X86::ESP)
-		.addMemOperand(MBB.getParent()->getMachineMemOperand(MachinePointerInfo(sp),
-								     MachineMemOperand::MOStore,
-								     AddrBytes,
-								     AddrAlign));
-	      ++NumInstructions;
+	      if (shouldSaveSP(*MBBI, TRI)) {
+		BuildMI(MBB, MBBI, DL, TII->get(Is64Bit ? X86::MOV64mr : X86::MOV32mr))
+		  .addReg(Is64Bit ? X86::RIP : X86::NoRegister)
+		  .addImm(1)
+		  .addReg(0)
+		  .addGlobalAddress(sp, 0)
+		  .addReg(0)
+		  .addReg(Is64Bit ? X86::RSP : X86::ESP)
+		  .addMemOperand(MBB.getParent()->getMachineMemOperand(MachinePointerInfo(sp),
+								       MachineMemOperand::MOStore,
+								       AddrBytes,
+								       AddrAlign));
+		++NumInstructions;
+	      }
 	    }
 
-	    if (clou::enabled.prech && Is64Bit) {
+	    if (clou::enabled.prech && Is64Bit && shouldHardenUnusedArgs(*MBBI)) {
 	    
 	      // Zero out any unused parameter-passing registers
 	      for (const auto param_gpr : std::array<MCPhysReg, 6> {X86::EDI, X86::ESI, X86::EDX,
@@ -111,7 +154,7 @@ namespace {
 
 	    }
 
-	    if (clou::enabled.postch) {
+	    if (clou::enabled.postch && false) {
 	    
 	      const auto MBBI_next = std::next(MBBI);
 	      if (MBBI_next != MBB.end()) {
@@ -127,7 +170,8 @@ namespace {
 		  .addReg(ZeroReg32)
 		  .addReg(ZeroReg32);
 		++NumInstructions;
-		
+
+		// cmp rsp, [func_sp]
 		BuildMI(MBB, MBBI_next, DL, TII->get(Is64Bit ? X86::CMP64rm : X86::CMP32rm))
 		  .addReg(Is64Bit ? X86::RSP : X86::ESP)
 		  .addReg(Is64Bit ? X86::RIP : X86::NoRegister)
@@ -161,13 +205,37 @@ namespace {
 	      
 	      }
 	      
+	    } else if (clou::enabled.postch) {
+	      // Just reload the stack pointer.
+	      // FIXME: Should be able to do this eventually.
+	      if (F.hasFnAttribute(clou::FnAttr_fps_usestack) && false) {
+		BuildMI(MBB, std::next(MBBI), DL, TII->get(X86::LEA64r), X86::RSP)
+		  .addReg(X86::RIP)
+		  .addImm(1)
+		  .addReg(X86::NoRegister)
+		  .addGlobalAddress(stack, clou::StackSize)
+		  .addReg(X86::NoRegister);
+	      } else {
+		BuildMI(MBB, std::next(MBBI), DL, TII->get(X86::MOV64rm), X86::RSP)
+		.addReg(X86::RIP)
+		.addImm(1)
+		.addReg(X86::NoRegister)
+		.addGlobalAddress(sp, 0)
+		.addReg(X86::NoRegister)
+		.addMemOperand(MBB.getParent()->getMachineMemOperand(MachinePointerInfo(sp),
+								     MachineMemOperand::MOLoad,
+								     AddrBytes,
+								     AddrAlign));
+	      }
+	      ++NumInstructions;
+	      ++NumMitigations;
 	    }
 	  }
 	}
       }
 
       if (clou::enabled.fps) {
-	
+
 	// well, save the base pointer at least
 	const MCPhysReg csrs[] = {Is64Bit ? X86::RBX : X86::EBX};
 	MF.getRegInfo().setCalleeSavedRegs(csrs);

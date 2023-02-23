@@ -640,15 +640,19 @@ void X86RegisterInfo::adjustStackMapLiveOutMask(uint32_t *Mask) const {
 //===----------------------------------------------------------------------===//
 
 static bool CantUseSP(const MachineFrameInfo &MFI) {
+#if 0
   if (clou::enabled.fps)
     return true;
+#endif
 
   return MFI.hasVarSizedObjects() || MFI.hasOpaqueSPAdjustment();
 }
 
 bool X86RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
+#if 0
   if (clou::enabled.fps)
     return true;
+#endif
   
   const X86MachineFunctionInfo *X86FI = MF.getInfo<X86MachineFunctionInfo>();
   if (X86FI->hasPreallocatedCall())

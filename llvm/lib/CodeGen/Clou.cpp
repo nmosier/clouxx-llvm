@@ -196,5 +196,17 @@ namespace clou {
     llvm::cl::location(STWeight),
     llvm::cl::init(1)
   };
+
+  bool ExpandSTs;
+  static llvm::cl::opt<bool, true> ExpandSTs_ {
+    "clou-expand-sts",
+    llvm::cl::desc("Expand STs (EXPERIMENTAL)"),
+    llvm::cl::location(ExpandSTs),
+    llvm::cl::init(false)
+  };
+
+  llvm::StringRef FnAttr_fps_usestack("llsct_fps_usestack");
+
+  const uint64_t StackSize = 0x10000;
   
 }

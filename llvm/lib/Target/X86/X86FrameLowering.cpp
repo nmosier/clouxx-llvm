@@ -1702,24 +1702,37 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
   // CLOU: load function-local stack
   if (clou::enabled.fps) {
     const Function& F = MF.getFunction();
-    const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
     const unsigned AddrBytes = Is64Bit ? 8 : 4;
     const Align AddrAlign(AddrBytes);
-    BuildMI(MBB, MBBI, DL, TII.get(Is64Bit ? X86::MOV64rm : X86::MOV32rm), Is64Bit ? X86::RSP : X86::ESP)
-      .addReg(Is64Bit ? X86::RIP : X86::NoRegister)
-      .addImm(1)
-      .addReg(X86::NoRegister)
-      .addGlobalAddress(sp, 0)
-      .addReg(X86::NoRegister)
-      .addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp), MachineMemOperand::MOLoad, AddrBytes,
-					     AddrAlign));
+    if (F.hasFnAttribute(clou::FnAttr_fps_usestack)) {
+      const GlobalValue *stack = F.getParent()->getNamedValue((F.getName() + "_stack").str());
+      assert(stack != nullptr);
+      BuildMI(MBB, MBBI, DL, TII.get(X86::LEA64r), X86::RSP)
+	.addReg(X86::RIP)
+	.addImm(1)
+	.addReg(X86::NoRegister)
+	.addGlobalAddress(stack, clou::StackSize)
+	.addReg(X86::NoRegister);
+    } else {
+      const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
+      BuildMI(MBB, MBBI, DL, TII.get(Is64Bit ? X86::MOV64rm : X86::MOV32rm), Is64Bit ? X86::RSP : X86::ESP)
+	.addReg(Is64Bit ? X86::RIP : X86::NoRegister)
+	.addImm(1)
+	.addReg(X86::NoRegister)
+	.addGlobalAddress(sp, 0)
+	.addReg(X86::NoRegister)
+	.addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp), MachineMemOperand::MOLoad, AddrBytes,
+					       AddrAlign));
+      constexpr int64_t padding = 24;
+      emitSPUpdate(MBB, MBBI, DL, -padding, false);
+    }
     ++FPSNumInstructions;
     ++FPSNumMitigations;
-    constexpr int64_t padding = 64;
-    emitSPUpdate(MBB, MBBI, DL, -padding, false);
 
     if (clou::InsertTrapAfterMitigations)
       BuildMI(MBB, MBBI, DL, TII.get(X86::MFENCE));
+
+    // FIXME: Avoid realignment when necessary.
   }
 
   // Realign stack after we pushed callee-saved registers (so that we'll be
@@ -2012,6 +2025,22 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
 
   // At this point we know if the function has WinCFI or not.
   MF.setHasWinCFI(HasWinCFI);
+
+  // LLSCT: Save stack pointer.
+  if (clou::enabled.fps && false) {
+    const Function& F = MF.getFunction();
+    const GlobalValue *sp = F.getParent()->getNamedValue((F.getName() + "_sp").str());
+    BuildMI(MBB, MBBI, DL, TII.get(X86::MOV64mr))
+      .addReg(X86::RIP)
+      .addImm(1)
+      .addReg(X86::NoRegister)
+      .addGlobalAddress(sp, 0)
+      .addReg(X86::NoRegister)
+      .addReg(X86::RSP)
+      .addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp), MachineMemOperand::MOStore, 8, Align(8)));
+    ++FPSNumInstructions;
+    ++FPSNumMitigations;
+  }
 }
 
 bool X86FrameLowering::canUseLEAForSPInEpilogue(
