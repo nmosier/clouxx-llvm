@@ -50,6 +50,8 @@
 #include "llvm/Transforms/Instrumentation/AddressSanitizerCommon.h"
 #include <string>
 
+#include "llvm/Clou/Clou.h"
+
 using namespace llvm;
 
 namespace {
@@ -2679,4 +2681,12 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
   }
 
   EmitAndCountInstruction(TmpInst);
+
+  if (clou::enabled.fallthru &&
+      (MI->isReturn() || MI->isUnconditionalBranch() || MI->isIndirectBranch())) {
+    // Add an LFENCE at the end.
+    MCInst LfenceInst;
+    LfenceInst.setOpcode(X86::LFENCE);
+    EmitAndCountInstruction(LfenceInst);
+  }
 }

@@ -26,7 +26,8 @@ namespace clou {
   X(ncsrs, true)				\
   X(stackinit, false)				\
   X(prech, true)				\
-  Y(postch, true)
+  X(postch, true)				\
+  Y(fallthru, true)
   
 
   

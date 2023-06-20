@@ -1834,6 +1834,34 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
         .setMIFlag(MachineInstr::FrameSetup);
   }
 
+  // LLSCT: Take max of stack begin and new pointer
+  if (clou::enabled.fps) {
+    const Function& F = MF.getFunction();
+    if (!F.hasFnAttribute(clou::FnAttr_fps_usestack)) {
+      const GlobalValue *stack = F.getParent()->getNamedValue((F.getName() + "_stack").str());
+      assert(stack && "Forgot to run IR FPS pass!");
+
+      // lea r11, [rel foo_stack]
+      BuildMI(MBB, MBBI, DL, TII.get(X86::LEA64r), X86::R11)
+	.addReg(X86::RIP)
+	.addImm(1)
+	.addReg(X86::NoRegister)
+	.addGlobalAddress(stack, 0)
+	.addReg(X86::NoRegister);
+      
+      // cmp rsp, r11
+      BuildMI(MBB, MBBI, DL, TII.get(X86::CMP64rr))
+	.addReg(X86::RSP)
+	.addReg(X86::R11);
+      
+      // cmovl rsp, r11
+      BuildMI(MBB, MBBI, DL, TII.get(X86::CMOV64rr), X86::RSP)
+	.addReg(X86::RSP)
+	.addReg(X86::R11)
+	.addImm(X86::COND_B);
+    }
+  }
+
   int SEHFrameOffset = 0;
   unsigned SPOrEstablisher;
   if (IsFunclet) {
@@ -2339,6 +2367,50 @@ void X86FrameLowering::emitEpilogue(MachineFunction &MF,
   // Emit tilerelease for AMX kernel.
   if (X86FI->hasVirtualTileReg())
     BuildMI(MBB, Terminator, DL, TII.get(X86::TILERELEASE));
+
+  /* LLSCT: bounds clip SP
+   * lea rdi, [rel foo_stack+foo_stacksize]
+   * lea rsi, [rel foo_stack]
+   * cmp rsp, rdi
+   * cmovae rsp, rsi
+   */
+#if 0
+  if (clou::enabled.fps) {
+    const Function& F = MF.getFunction();
+    if (!F.hasFnAttribute(clou::FnAttr_fps_usestack)) {
+      const GlobalValue *stack = F.getParent()->getNamedValue((F.getName() + "_stack").str());
+      assert(stack && "Forgot to run IR FPS pass!");
+
+      // lea rdi, [rel foo_stackend]
+      BuildMI(MBB, MBBI, DL, TII.get(X86::LEA64r), X86::RDI)
+	.addReg(X86::RIP)
+	.addImm(1)
+	.addReg(X86::NoRegister)
+	.addGlobalAddress(stack, clou::StackSize)
+	.addReg(X86::NoRegister);
+
+      // lea rsi, [rel foo_stackbegin]
+      BuildMI(MBB, MBBI, DL, TII.get(X86::LEA64r), X86::RSI)
+	.addReg(X86::RIP)
+	.addImm(1)
+	.addReg(X86::NoRegister)
+	.addGlobalAddress(stack, 0)
+	.addReg(X86::NoRegister);
+
+      // cmp rsp, rdi
+      BuildMI(MBB, MBBI, DL, TII.get(X86::CMP64rr))
+	.addReg(X86::RSP)
+	.addReg(X86::RDI);
+
+      // cmova rsp, rsi
+      BuildMI(MBB, MBBI, DL, TII.get(X86::CMOV64rr), X86::RSP)
+	.addReg(X86::RSP)
+	.addReg(X86::RSI)
+	.addImm(X86::COND_AE);
+    }
+  }
+#endif
+  
 }
 
 StackOffset X86FrameLowering::getFrameIndexReference(const MachineFunction &MF,
