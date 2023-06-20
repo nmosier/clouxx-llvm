@@ -1723,7 +1723,11 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
 	.addReg(X86::NoRegister)
 	.addMemOperand(MF.getMachineMemOperand(MachinePointerInfo(sp), MachineMemOperand::MOLoad, AddrBytes,
 					       AddrAlign));
-      constexpr int64_t padding = 24;
+      int64_t padding;
+      if (clou::enabled.ncsrs)
+	padding = 24;
+      else
+	padding = 8 * 7 /* max # of CSRs */ + 8 /* return address */;
       emitSPUpdate(MBB, MBBI, DL, -padding, false);
     }
     ++FPSNumInstructions;
