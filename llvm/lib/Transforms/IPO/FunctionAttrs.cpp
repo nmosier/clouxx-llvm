@@ -1577,20 +1577,26 @@ static void addNoRecurseAttrs(const SCCNodeSet &SCCNodes,
     return;
 
   Function *F = *SCCNodes.begin();
+  // NMOSIER: added '&& false'
   if (!F || !F->hasExactDefinition() || F->doesNotRecurse())
     return;
-
+  
   // If all of the calls in F are identifiable and are to norecurse functions, F
   // is norecurse. This check also detects self-recursion as F is not currently
   // marked norecurse, so any called from F to F will not be marked norecurse.
-  for (auto &BB : *F)
-    for (auto &I : BB.instructionsWithoutDebug())
-      if (auto *CB = dyn_cast<CallBase>(&I)) {
+  for (auto &BB : *F) {
+    for (auto &I : BB.instructionsWithoutDebug()) {
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+	// NMOSIER: Intrinsics cannot recurse. That would be stupid.
+	continue;
+      } else if (auto *CB = dyn_cast<CallBase>(&I)) {
         Function *Callee = CB->getCalledFunction();
         if (!Callee || Callee == F || !Callee->doesNotRecurse())
           // Function calls a potentially recursive function.
           return;
       }
+    }
+  }
 
   // Every call was to a non-recursive function other than this function, and
   // we have no indirect recursion as the SCC size is one. This function cannot

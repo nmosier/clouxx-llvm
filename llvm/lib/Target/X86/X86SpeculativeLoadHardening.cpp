@@ -485,6 +485,9 @@ bool X86SpeculativeLoadHardeningPass::runOnMachineFunction(
     BuildMI(Entry, EntryInsertPt, Loc, TII->get(X86::LFENCE));
     ++NumInstsInserted;
     ++NumLFENCEsInserted;
+
+    if (clou::InsertTrapAfterMitigations)
+      BuildMI(Entry, EntryInsertPt, Loc, TII->get(X86::MFENCE));
   }
 
   // If we guarded the entry with an LFENCE and have no conditionals to protect
@@ -616,6 +619,9 @@ void X86SpeculativeLoadHardeningPass::hardenEdgesWithLFENCE(
     BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(X86::LFENCE));
     ++NumInstsInserted;
     ++NumLFENCEsInserted;
+
+    if (clou::InsertTrapAfterMitigations)
+      BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(X86::MFENCE));
   }
 }
 
@@ -1788,6 +1794,9 @@ void X86SpeculativeLoadHardeningPass::hardenLoadAddr(
     Op->setReg(TmpReg);
     ++NumAddrRegsHardened;
     ++SctNumMitigations;
+
+    if (clou::InsertTrapAfterMitigations)
+      BuildMI(MBB, InsertPt, Loc, TII->get(X86::MFENCE));
   }
 
   // And restore the flags if needed.
@@ -2007,6 +2016,10 @@ unsigned X86SpeculativeLoadHardeningPass::hardenPostLoad(MachineInstr &MI) {
 
   ++NumPostLoadRegsHardened;
   ++SctNumMitigations;
+
+  if (clou::InsertTrapAfterMitigations)
+    BuildMI(MBB, MI, Loc, TII->get(X86::MFENCE));
+  
   return HardenedReg;
 }
 
@@ -2099,6 +2112,10 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughCall(
     BuildMI(MBB, std::next(InsertPt), Loc, TII->get(X86::LFENCE));
     ++NumInstsInserted;
     ++NumLFENCEsInserted;
+
+    if (clou::InsertTrapAfterMitigations)
+      BuildMI(MBB, std::next(InsertPt), Loc, TII->get(X86::MFENCE));
+    
     return;
   }
 
@@ -2292,6 +2309,9 @@ void X86SpeculativeLoadHardeningPass::hardenIndirectCallOrJumpInstr(
 
   ++NumCallsOrJumpsHardened;
   ++SctNumMitigations;
+
+  if (clou::InsertTrapAfterMitigations)
+    BuildMI(*MI.getParent(), MI, MI.getDebugLoc(), TII->get(X86::MFENCE));
 }
 
 INITIALIZE_PASS_BEGIN(X86SpeculativeLoadHardeningPass, PASS_KEY,

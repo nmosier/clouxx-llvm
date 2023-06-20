@@ -19,11 +19,15 @@ namespace clou {
   X(ncal_glob, true)				\
   X(ncas_xmit, true)				\
   X(ncas_ctrl, true)				\
+  X(entry_xmit, false)				\
   X(load_xmit, false)				\
+  X(call_xmit, false)				\
   X(fps, true)					\
+  X(ncsrs, true)				\
+  X(stackinit, false)				\
   X(prech, true)				\
   Y(postch, true)
-    
+  
 
   
   struct Subcomponents {
@@ -67,6 +71,12 @@ namespace clou {
 
   extern llvm::StringRef FnAttr_fps_usestack;
   extern const uint64_t StackSize;
+
+  extern bool StrictCallingConv;
+
+  extern bool NCASAll;
+  extern float Timeout;
 }
+
 
 #endif

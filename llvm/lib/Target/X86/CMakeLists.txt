@@ -84,8 +84,10 @@ set(sources
   X86WinEHState.cpp
   X86InsertWait.cpp
   X86FunctionLocalStacks.cpp
+  X86NoSpillPass.cpp
   )
 
+add_compile_options(-g -O0)
 add_llvm_target(X86CodeGen ${sources}
   LINK_COMPONENTS
   Analysis

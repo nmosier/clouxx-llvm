@@ -83,13 +83,24 @@ namespace clou {
 
   namespace {
 
+    static Subcomponents& operator|=(Subcomponents& a, const Subcomponents& b) {
+#define SUBCOMPONENTS_OR(name, init) a.name |= b.name;
+      SUBCOMPONENTS_X(SUBCOMPONENTS_OR, SUBCOMPONENTS_OR)
+#undef SUBCOMPONENTS_OR
+	return a;
+    }
+
     llvm::cl::opt<std::string> ClouOpt {
       "clou",
       llvm::cl::desc("Enable LLVM-SCT a.k.a. ClouCC"),
       llvm::cl::ValueOptional,
       llvm::cl::ZeroOrMore,
-      llvm::cl::callback([] (const std::string& s) {
-	enabled = Subcomponents(s);
+      llvm::cl::callback([] (const std::string& s_) {
+	llvm::StringRef s(s_);
+	if (s.startswith("+"))
+	  enabled |= Subcomponents(s.drop_front());
+	else
+	  enabled = Subcomponents(s);
       }),
     };
     
@@ -208,5 +219,30 @@ namespace clou {
   llvm::StringRef FnAttr_fps_usestack("llsct_fps_usestack");
 
   const uint64_t StackSize = 0x10000;
-  
+
+
+  bool StrictCallingConv;
+  static llvm::cl::opt<bool, true> StrictCallingConv_ {
+    "llsct-strict-cc",
+    llvm::cl::desc("LLSCT's Strict Calling Convention"),
+    llvm::cl::location(StrictCallingConv),
+    llvm::cl::init(true)
+  };
+
+
+  bool NCASAll;
+  static llvm::cl::opt<bool, true> NCASAll_ {
+    "llsct-ncas-all",
+    llvm::cl::desc("Treat all NCA stores as having secret value operands"),
+    llvm::cl::location(NCASAll),
+    llvm::cl::init(false)
+  };
+
+  float Timeout;
+  static llvm::cl::opt<float, true> TimeoutOpt {
+    "llsct-timeout",
+    llvm::cl::desc("Set timeout for fence pass"),
+    llvm::cl::location(Timeout),
+    llvm::cl::init(0)
+  };
 }

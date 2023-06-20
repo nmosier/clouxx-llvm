@@ -4619,7 +4619,7 @@ X86TargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
   }
 
   // CLOU: EXPERIMENTAL
-  if (clou::enabled.fps) {
+  if (clou::enabled.ncsrs) {
     Mask = RegInfo->getNoPreservedMask();
   }
   

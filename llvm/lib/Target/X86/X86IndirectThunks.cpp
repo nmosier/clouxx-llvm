@@ -42,6 +42,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Clou/Clou.h"
 
 using namespace llvm;
 
@@ -248,6 +249,10 @@ void RetpolineThunkInserter::populateThunk(MachineFunction &MF) {
       .addReg(ThunkReg);
 
   CallTarget->back().setPreInstrSymbol(MF, TargetSym);
+
+  if (clou::InsertTrapAfterMitigations)
+    BuildMI(CallTarget, DebugLoc(), TII->get(X86::MFENCE));
+  
   BuildMI(CallTarget, DebugLoc(), TII->get(RetOpc));
 }
 

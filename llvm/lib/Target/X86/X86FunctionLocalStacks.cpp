@@ -1,3 +1,5 @@
+#include <iostream>
+
 #include "X86.h"
 #include "X86InstrInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -7,6 +9,9 @@
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/Clou/Clou.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+
+#include "llvm/Support/raw_os_ostream.h"
 
 using namespace llvm;
 
@@ -15,6 +20,8 @@ STATISTIC(NumMitigations, "Number of mitigations");
 STATISTIC(NumInstructions, "Number of instructions inserted");
 
 namespace {
+
+  volatile raw_os_ostream raw_os_ostream_(std::cerr);
 
   class X86FunctionLocalStacks final: public MachineFunctionPass {
   public:
@@ -67,7 +74,7 @@ namespace {
     }
 
     bool runOnMachineFunction(MachineFunction& MF) override {
-      if (!clou::enabled.fps && !clou::enabled.prech && !clou::enabled.postch) {
+      if (!clou::enabled.fps && !clou::enabled.prech && !clou::enabled.postch && !clou::enabled.stackinit && false) {
 	return false;
       }
       
@@ -234,7 +241,7 @@ namespace {
 	}
       }
 
-      if (clou::enabled.fps) {
+      if (clou::enabled.ncsrs) {
 
 	// well, save the base pointer at least
 	const MCPhysReg csrs[] = {Is64Bit ? X86::RBX : X86::EBX};
@@ -242,25 +249,116 @@ namespace {
 	
       }
 
-#if 0
-      for (const MachineBasicBlock& MBB : MF) {
-	for (const MachineInstr& MI : MBB) {
-	  for (const MachineOperand& MO : MI.operands()) {
-	    if (MO.isReg()) {
-	      const Register Reg = MO.getReg();
-	      if (Reg.isPhysical()) {
-		const unsigned Bits = TRI.getRegSizeInBits(*TRI.getMinimalPhysRegClass(Reg.asMCReg()));
-		if (Bits == 64) {
-		  errs() << "64 BITS: " << MI;
-		}
+      if (clou::enabled.stackinit)
+	initializeStackSlots(MF);
+      
+      return true;
+    }
+
+    bool initializeStackSlots(MachineFunction& MF) {
+      // const MachineFrameInfo& MFI = MF.getFrameInfo();
+      const auto& TII = MF.getSubtarget().getInstrInfo();
+
+      // Find CA stack loads that are reachable without seeing a same-address CA stack store.
+      // Or just check for LEAs too?
+      struct FrameAccess {
+	int FrameIdx;
+	int64_t Offset;
+	unsigned Size;
+
+	auto tuple() const {
+	  return std::make_tuple(FrameIdx, Offset, Size);
+	}
+	
+	bool operator<(const FrameAccess& o) const {
+	  return tuple() < o.tuple();
+	}
+
+	bool operator==(const FrameAccess& o) const {
+	  return tuple() == o.tuple();
+	}
+      };
+      std::vector<FrameAccess> FIs;
+
+      // Collect the frame indices of all CA stack loads.
+      for (MachineBasicBlock& MBB : MF) {
+	for (MachineInstr& MI : MBB) {
+	  if (MI.mayLoad() || MI.getOpcode() == X86::LEA64r) {
+	    const MCInstrDesc& Desc = MI.getDesc();
+	    int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
+	    if (MemRefBeginIdx < 0)
+	      continue;
+	    MemRefBeginIdx += X86II::getOperandBias(Desc);
+	    const MachineOperand& BaseMO = MI.getOperand(MemRefBeginIdx + X86::AddrBaseReg);
+	    if (BaseMO.isFI()) {
+	      const int FI = BaseMO.getIndex();
+	      if (FI >= 0) {
+		const MachineOperand& DispMO = MI.getOperand(MemRefBeginIdx + X86::AddrDisp);
+		assert(DispMO.isImm() && "Expected AddrDisp to be immediate in CA stack load!");
+		const int64_t Offset = DispMO.getImm();
+		if (Offset != 0 && false)
+		  continue;
+
+		// get memory operand
+		const auto it = llvm::find_if(MI.memoperands(), [] (const MachineMemOperand *MMO) {
+		  return MMO->isLoad();
+		});
+		if (it == MI.memoperands_end())
+		  continue;
+		const auto *MMO = *it;
+		
+		// FIXME: Currently hard-coding size since I don't know how to find the byte size of the operand.
+		FIs.push_back({.FrameIdx = FI, .Offset = Offset, .Size = static_cast<unsigned>(MMO->getSize())});
 	      }
+	    } else if (BaseMO.isReg()) {
+	    } else {
+	      llvm_unreachable("address base operand is neither frame index nor register!");
 	    }
 	  }
 	}
       }
-#endif
+
+      // Break up accesses of > 8 bytes into <= bytes.
+      for (unsigned i = 0; i < FIs.size(); ) {
+	auto it = FIs.begin() + i;
+	if (it->Size > 8) {
+	  assert(it->Size % 2 == 0 && "Size must be divisible by 2!");
+	  it->Size /= 2;
+	  auto newit = FIs.insert(it, *it);
+	  newit->Offset += newit->Size;
+	} else {
+	  ++i;
+	}
+      }
+
+      llvm::sort(FIs);
+      FIs.resize(std::unique(FIs.begin(), FIs.end()) - FIs.begin());
       
-      return true;
+      for (const auto& Access : FIs) {
+	// const int64_t Size = MFI.getObjectSize(Access.FrameIdx);
+	static const std::map<int, int> OpcodeMap = {
+	  {1, X86::MOV8mi},
+	  {2, X86::MOV16mi},
+	  {4, X86::MOV32mi},
+	  {8, X86::MOV64mi32},
+	};
+	const int Opcode = OpcodeMap.at(Access.Size);
+	auto& MBB = MF.front();
+	BuildMI(MBB, MBB.begin(), DebugLoc(), TII->get(Opcode))
+	  .addFrameIndex(Access.FrameIdx)
+	  .addImm(1)
+	  .addReg(X86::NoRegister)
+	  .addImm(0)
+	  .addReg(X86::NoRegister)
+	  .addImm(0)
+	  .addMemOperand(MF.getMachineMemOperand(MachinePointerInfo::getFixedStack(MF, Access.FrameIdx,
+										   Access.Offset),
+						 MachineMemOperand::MOStore,
+						 Access.Size,
+						 Align(Access.Size)));
+      }
+
+      return !FIs.empty();
     }
   };
 
