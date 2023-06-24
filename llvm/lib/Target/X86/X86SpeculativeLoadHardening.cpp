@@ -54,14 +54,14 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/ADT/SmallSet.h"
 #include <algorithm>
 #include <cassert>
 #include <iterator>
 #include <utility>
-
+#include <variant>
 #include <fstream>
-#include <string>
-#include "llvm/Clou/Clou.h"
+#include <queue>
 #include "llvm/Support/raw_os_ostream.h"
 
 using namespace llvm;
@@ -79,23 +79,6 @@ STATISTIC(NumCallsOrJumpsHardened,
           "Number of calls or jumps requiring extra hardening");
 STATISTIC(NumInstsInserted, "Number of instructions inserted");
 STATISTIC(NumLFENCEsInserted, "Number of lfence instructions inserted");
-
-static unsigned SctNumMitigations;
-
-struct PrintNumMitigations {
-  llvm::StringRef name;
-  PrintNumMitigations(llvm::StringRef name): name(name) { SctNumMitigations = 0; }
-  ~PrintNumMitigations() {
-    if (clou::ClouLog) {
-      std::string s;
-      llvm::raw_string_ostream ss(s);
-      ss << clou::ClouLogDir << "/mitigations.tab";
-      std::ofstream ofs (s, std::ios::app);
-      llvm::raw_os_ostream os(ofs);
-      os << name << " " << SctNumMitigations << "\n";
-    }
-  }
-};
 
 static cl::opt<bool> EnableSpeculativeLoadHardening(
     "x86-speculative-load-hardening",
@@ -141,6 +124,39 @@ static cl::opt<bool> HardenIndirectCallsAndJumps(
              "mitigate Spectre v1.2 style attacks."),
     cl::init(true), cl::Hidden);
 
+static cl::opt<bool> HardenOneBranchCondition(
+    PASS_KEY "-sbh",
+    cl::desc("Harden one branch condition. "
+	      "Is is designed to mitigate nesty branch attack."),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> HardenAllBranchConditions(
+    PASS_KEY "-sbhAll",
+    cl::desc("Harden all branch conditions. "
+	     "In some race conditions, hardening one operand may not be enough."),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> HardenFixedAddress(
+    PASS_KEY "-fixed",
+    cl::desc("Harden fixed addresses.(RIP-relative, RBP, RSP) "),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> HardenStoreAddress(
+    PASS_KEY "-store",
+    cl::desc("Harden the address of storing variables. An access to "
+	     "the store address will also leak info."),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> HardenVariantTimingInstr(
+    PASS_KEY "-vtInstr",
+    cl::desc("Harden variable timing Instructions. They "
+	     "also leak info in the Speculation."),
+    cl::init(false), cl::Hidden);
+
+static cl::opt<bool> EnableBlade(PASS_KEY "-blade",
+				 cl::desc("Enable Blade-inspired SLH hardening"),
+				 cl::init(false), cl::Hidden);
+
 namespace {
 
 class X86SpeculativeLoadHardeningPass : public MachineFunctionPass {
@@ -157,6 +173,7 @@ public:
   static char ID;
 
 private:
+
   /// The information about a block's conditional terminators needed to trace
   /// our predicate state through the exiting edges.
   struct BlockCondInfo {
@@ -232,6 +249,32 @@ private:
   void hardenIndirectCallOrJumpInstr(
       MachineInstr &MI,
       SmallDenseMap<unsigned, unsigned, 32> &AddrRegToHardenedReg);
+
+
+
+  // Harden Conditional Branch
+  unsigned hardenBranch(MachineInstr &MI, 
+		    SmallDenseMap<unsigned, unsigned, 32> &AddrRegToHardenedReg);
+
+  // Reuse this function to harden the value but not propagate it.
+  unsigned hardenValueInCondition(MachineBasicBlock &MBB, MachineInstr &MI, 
+		    DebugLoc Loc, int OpIdx); 
+  
+  // Harden the memory access to fixed-address
+  unsigned hardenFixedAddress(MachineInstr &MI, int special = 0); 
+
+  // Harden the storing address
+  unsigned hardenStore(MachineInstr &MI); 
+
+  // Harden Floating Point Instructions, REPEAT Instructions
+  unsigned hardenVariantTimingInstr(MachineInstr &MI,
+		    SmallDenseMap<unsigned, unsigned, 32> &AddrRegToHardenedReg,
+		    int OpIdx, int special = 0);
+  
+  // Harden X87 Instructions
+  unsigned hardenX87(MachineFunction &MF);
+
+  void blade(MachineFunction& MF);
 };
 
 } // end anonymous namespace
@@ -422,8 +465,6 @@ bool X86SpeculativeLoadHardeningPass::runOnMachineFunction(
   LLVM_DEBUG(dbgs() << "********** " << getPassName() << " : " << MF.getName()
                     << " **********\n");
 
-  PrintNumMitigations print_num_mitigations(MF.getName());
-
   // Only run if this pass is forced enabled or we detect the relevant function
   // attribute requesting SLH.
   if (!EnableSpeculativeLoadHardening &&
@@ -485,9 +526,6 @@ bool X86SpeculativeLoadHardeningPass::runOnMachineFunction(
     BuildMI(Entry, EntryInsertPt, Loc, TII->get(X86::LFENCE));
     ++NumInstsInserted;
     ++NumLFENCEsInserted;
-
-    if (clou::InsertTrapAfterMitigations)
-      BuildMI(Entry, EntryInsertPt, Loc, TII->get(X86::MFENCE));
   }
 
   // If we guarded the entry with an LFENCE and have no conditionals to protect
@@ -581,8 +619,383 @@ bool X86SpeculativeLoadHardeningPass::runOnMachineFunction(
 
   LLVM_DEBUG(dbgs() << "Final speculative load hardened function:\n"; MF.dump();
              dbgs() << "\n"; MF.verify(this));
+
   return true;
 }
+
+static int getMemRefBeginIdx(const MCInstrDesc& Desc) {
+  int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
+  if (MemRefBeginIdx < 0)
+    return -1;
+  MemRefBeginIdx += X86II::getOperandBias(Desc);
+  return MemRefBeginIdx;
+}
+
+static int getMemRefBeginIdx(const MachineInstr& MI) {
+  return getMemRefBeginIdx(MI.getDesc());
+}
+
+static bool getTransmittedOperands(MachineInstr& MI, SmallVectorImpl<Register>& Ops) {
+  if (none_of(MI.uses(), [] (const MachineOperand& MO) {
+    return MO.isReg() && MO.isUse();
+  })) {
+    return false;
+  }
+
+  if (MI.mayLoad() || MI.mayStore()) {
+    // Try to get memory operand.
+    int MemIdx = getMemRefBeginIdx(MI);
+    if (MemIdx >= 0) {
+      const MachineOperand& BaseMO = MI.getOperand(MemIdx + X86::AddrBaseReg);
+      if (BaseMO.isReg() && BaseMO.getReg().isVirtual())
+	Ops.push_back(BaseMO.getReg());
+      const MachineOperand& IndexMO = MI.getOperand(MemIdx + X86::AddrIndexReg);
+      if (IndexMO.isReg() && IndexMO.getReg().isVirtual())
+	Ops.push_back(IndexMO.getReg());
+    }
+  } else {
+    switch (MI.getOpcode()) {
+    case X86::DIV8r:
+    case X86::DIV16r:
+    case X86::DIV32r:
+    case X86::DIV64r:
+      for (MachineOperand& MO : MI.uses())
+	if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
+	  Ops.push_back(MO.getReg());
+      break;
+
+    case X86::COPY:  {
+      // Check if this is part of a function call.
+      const MachineInstr *it;
+      for (it = MI.getNextNode(); it && it->getOpcode() == X86::COPY; it = it->getNextNode())
+	;
+      if (!(it && (it->isCall() || it->isReturn())))
+	break;
+      for (const MachineOperand& MO : MI.uses()) {
+	if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
+	  Ops.push_back(MO.getReg());
+      }
+      break;
+    }
+      
+    case X86::RET:
+      // TODO
+      break;
+    }
+  }
+
+  return !Ops.empty();
+}
+
+static void traceLoadSources(MachineOperand *MO, SmallVectorImpl<MachineOperand *>& Loads,
+			     SmallSet<MachineOperand *, 4>& Seen) {
+  const auto *MRI = &MO->getParent()->getParent()->getParent()->getRegInfo();
+
+  if (!Seen.insert(MO).second)
+    return;
+
+  assert(MO->isReg() && MO->isUse());
+  Register Reg = MO->getReg();
+  if (!Reg.isVirtual())
+    return;
+
+  for (MachineOperand& MO : MRI->def_operands(Reg)) {
+    assert(MO.isReg() && MO.isDef());
+    MachineInstr *MI = MO.getParent();
+    if (MI->mayLoad()) {
+      Loads.push_back(&MO);
+    } else {
+      for (MachineOperand& UseMO : MO.getParent()->uses()) {
+	if (UseMO.isReg() && UseMO.isUse()) {
+	  traceLoadSources(&UseMO, Loads, Seen);
+	}
+      }
+    }
+  }
+}
+
+static void traceLoadSources(MachineOperand *MO, SmallVectorImpl<MachineOperand *>& Loads) {
+  SmallSet<MachineOperand *, 4> Seen;
+  traceLoadSources(MO, Loads, Seen);
+}
+
+struct BladeSource {
+  auto operator<=>(const BladeSource&) const = default;
+};
+struct BladeSink {
+  auto operator<=>(const BladeSink&) const = default;
+};
+struct BladeUse {
+  Register Reg;
+  MachineInstr *MI;
+  auto operator<=>(const BladeUse&) const = default;
+};
+ 
+using BladeNode = std::variant<BladeUse, BladeSource, BladeSink>;
+using BladeDFG = std::map<BladeNode, std::set<BladeNode>>;
+struct BladeNode2 {
+  BladeNode v;
+  int id;
+  auto operator<=>(const BladeNode2&) const = default;
+};
+using BladeDFG2 = std::map<BladeNode2, std::map<BladeNode2, int>>;
+
+static void constructBladeDFG(MachineFunction& MF, BladeDFG& G) {
+  const auto& MRI = MF.getRegInfo();
+  
+  // Add register dependencies (interior nodes + edges).
+  for (MachineBasicBlock& MBB : MF) {
+    for (MachineInstr& MI : MBB) {
+      if (MI.mayLoad() || MI.mayStore())
+	continue;
+      for (MachineOperand& Def : MI.defs()) {
+	if (!(Def.isReg() && Def.isDef() && Def.getReg().isVirtual()))
+	  continue;
+	BladeNode src{BladeUse{Def.getReg(), &MI}};
+	for (MachineOperand& Use : MI.uses()) {
+	  if (!(Use.isReg() && Use.isUse() && Use.getReg().isVirtual()))
+	    continue;
+	  for (MachineOperand& NewDef : MRI.def_operands(Use.getReg())) {
+	    assert(NewDef.isReg() && NewDef.isDef());
+	    if (!NewDef.getReg().isVirtual())
+	      continue;
+	    BladeNode dst{BladeUse{NewDef.getReg(), NewDef.getParent()}};
+	    G[src].insert(dst);
+	  }
+	}
+      }
+    }
+  }
+
+  // Add source nodes + edges -- i.e., loads.
+  for (MachineBasicBlock& MBB : MF) {
+    for (MachineInstr& MI : MBB) {
+      if (!MI.mayLoad())
+	continue;
+      for (MachineOperand& Def : MI.defs()) {
+	if (!(Def.isReg() && Def.isDef() && Def.getReg().isVirtual()))
+	  continue;
+	BladeNode src{BladeSource{}};
+	BladeNode dst{BladeUse{Def.getReg(), &MI}};
+	G[src].insert(dst);
+      }
+    }
+  }
+
+  // Add sink nodes + edges -- i.e., transmitters.
+  for (MachineBasicBlock& MBB : MF) {
+    for (MachineInstr& MI : MBB) {
+      SmallVector<Register> SensitiveOperands;
+      if (!getTransmittedOperands(MI, SensitiveOperands))
+	continue;
+      errs() << "Transmitter: " << MI;
+      for (Register RegUse : SensitiveOperands) {
+	for (MachineOperand& RegDef : MRI.def_operands(RegUse)) {
+	  BladeNode src{BladeUse{RegDef.getReg(), RegDef.getParent()}};
+	  BladeNode dst{BladeSink{}};
+	  G[src].insert(dst);
+	}
+      }
+    }
+  }
+}
+
+static void dumpBladeDFG(raw_ostream& os, BladeDFG& G) {
+  os << "digraph {\n";
+
+  os << "source [label=\"S\", color=\"green\"]\n";
+  os << "sink [label=\"T\", color=\"red\"]\n";
+
+  const auto getName = [] (BladeNode node) -> std::string {
+    const auto visitor = makeVisitor([] (const BladeSource&) -> std::string { return "source"; },
+				     [] (const BladeSink&) -> std::string { return "sink"; },
+				     [] (const BladeUse& use) -> std::string {
+				       std::string s;
+				       raw_string_ostream ss(s);
+				       ss << "node_" << use.MI << "_" << use.Reg;
+				       return s;
+				     });
+    return std::visit(visitor, node);
+  };
+
+  {
+    std::set<BladeNode> nodes;
+    for (const auto& [src, dsts] : G) {
+      nodes.insert(src);
+      for (BladeNode dst : dsts)
+	nodes.insert(dst);
+    }
+    for (BladeNode node : nodes) {
+      if (const BladeUse *Def = std::get_if<BladeUse>(&node))
+	os << getName(node) << " [label=\"" << getName(node) << "\n" << *Def->MI << "\"];\n";
+    }
+  }
+
+  // edges
+  for (const auto& [src, dsts] : G) {
+    for (BladeNode dst : dsts) {
+      os << getName(src) << " -> " << getName(dst) << ";\n";
+    }
+  }
+  
+  os << "}\n";
+}
+
+static bool bladeBFS(BladeDFG2& R, BladeNode2 s, BladeNode2 t, std::map<BladeNode2, BladeNode2>& parent) {
+  parent.clear();
+  std::set<BladeNode2> visited;
+
+  std::queue<BladeNode2> q;
+  q.push(s);
+  visited.insert(s);
+
+  while (!q.empty()) {
+    auto u = q.front();
+    q.pop();
+    for (const auto& [v, w] : R[u]) {
+      if (visited.insert(v).second && w > 0) {
+	q.push(v);
+	parent[v] = u;
+      }
+    }
+  }
+
+  return visited.contains(t);
+}
+
+static void bladeDFS(BladeDFG2& R, BladeNode2 s, std::set<BladeNode2>& visited) {
+  visited.insert(s);
+  for (const auto& [i, w] : R[s]) {
+    if (w > 0 && !visited.contains(i))
+      bladeDFS(R, i, visited);
+  }
+}
+
+static void bladeMinCut2(BladeDFG2& G, BladeNode2 s, BladeNode2 t, std::set<std::pair<BladeNode2, BladeNode2>>& cut_edges) {
+  BladeDFG2 R = G;
+
+  std::map<BladeNode2, BladeNode2> parent;
+  while (bladeBFS(R, s, t, parent)) {
+    int path_flow = INT_MAX;
+    for (BladeNode2 v = t; v != s; v = parent.at(v)) {
+      BladeNode2 u = parent.at(v);
+      path_flow = std::min(path_flow, R[u][v]);
+    }
+    for (BladeNode2 v = t; v != s; v = parent.at(v)) {
+      BladeNode2 u = parent.at(v);
+      R[u][v] -= path_flow;
+      R[v][u] += path_flow;
+    }
+  }
+
+  std::set<BladeNode2> visited;
+  bladeDFS(R, s, visited);
+
+  for (const auto& [src, dsts] : G) {
+    for (const auto& [dst, w] : dsts) {
+      if (G[src][dst] > 0 && visited.contains(src) && !visited.contains(dst)) {
+	cut_edges.emplace(src, dst);
+      }
+    }
+  }
+}
+
+static void bladeMinCut(BladeDFG& G, std::set<BladeUse>& cut_nodes) {
+  // Duplicate BladeUses.
+  std::set<BladeNode> nodes;
+  for (const auto& [src, dsts] : G) {
+    nodes.insert(src);
+    for (const auto& dst : dsts) {
+      nodes.insert(dst);
+    }
+  }
+
+  BladeDFG2 H;
+
+  // Expand nodes.
+  for (const BladeNode& node : nodes) {
+    BladeNode2 src{node, 0};
+    BladeNode2 dst{node, 1};
+    auto& w = H[src][dst];
+    if (std::holds_alternative<BladeUse>(node)) {
+      w = 1;
+    } else {
+      w = INT_MAX;
+    }
+  }
+
+  // Add edges to expanded nodes.
+  for (auto& [src, dsts] : G) {
+    BladeNode2 src2{src, 1};
+    for (const BladeNode& dst : dsts) {
+      BladeNode2 dst2{dst, 0};
+      H[src2][dst2] = INT_MAX;
+    }
+  }
+
+  // Do min-cut.
+  std::set<std::pair<BladeNode2, BladeNode2>> cut_edges;
+  bladeMinCut2(H, BladeNode2{BladeSource{}, 0}, BladeNode2{BladeSink{}, 1}, cut_edges);
+
+  errs() << "cut " << cut_edges.size() << " edges\n";
+
+  for (const auto& [src, dst] : cut_edges) {
+    assert(src.v == dst.v);
+    assert(src.id == 0);
+    assert(dst.id == 1);
+    assert(std::holds_alternative<BladeUse>(src.v));
+    cut_nodes.insert(std::get<BladeUse>(src.v));
+  }
+}
+
+//
+void X86SpeculativeLoadHardeningPass::blade(MachineFunction& MF) {
+  BladeDFG DFG;
+		    
+  constructBladeDFG(MF, DFG);
+
+  // print it to dot file!
+  std::ofstream f("dfg.dot");
+  raw_os_ostream os(f);
+  dumpBladeDFG(os, DFG);
+
+  // perform min cut
+  std::set<BladeUse> cut_nodes;
+  bladeMinCut(DFG, cut_nodes);
+
+  // Do masking stuff
+  for (BladeUse Node : cut_nodes) {
+    if (count_if(Node.MI->defs(), [] (const MachineOperand& MO) {
+      return MO.isReg() && MO.isDef();
+    }) != 1) {
+      errs() << "Can't handle more than one register definition!\n";
+      std::abort();
+    }
+
+    if (!canHardenRegister(Node.Reg)) {
+      errs() << "[BLADE] cannot harden: " << *Node.MI;
+      continue;
+    }
+      
+
+#if 0
+    const auto MBBI = std::next(Node.MI->getIterator());
+    auto& MBB = *Node.MI->getParent();
+
+    Register HardenedReg = hardenValueInRegister(Node.Reg, MBB, MBBI, DebugLoc());
+    MRI->replaceRegWith(/*FromReg*/ Node.Reg, /*ToReg*/ HardenedReg);
+#else
+    hardenPostLoad(*Node.MI);
+#endif
+  }
+}
+
+
+
+
+
+
+
 
 /// Implements the naive hardening approach of putting an LFENCE after every
 /// potentially mis-predicted control flow construct.
@@ -619,9 +1032,6 @@ void X86SpeculativeLoadHardeningPass::hardenEdgesWithLFENCE(
     BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(X86::LFENCE));
     ++NumInstsInserted;
     ++NumLFENCEsInserted;
-
-    if (clou::InsertTrapAfterMitigations)
-      BuildMI(*MBB, InsertPt, DebugLoc(), TII->get(X86::MFENCE));
   }
 }
 
@@ -1169,7 +1579,7 @@ X86SpeculativeLoadHardeningPass::tracePredStateThroughIndirectBranches(
     // branch back to itself. We can do this here because at this point, every
     // predecessor of this block has an available value. This is basically just
     // automating the construction of a PHI node for this target.
-    Register TargetReg = TargetAddrSSA.GetValueInMiddleOfBlock(&MBB);
+    unsigned TargetReg = TargetAddrSSA.GetValueInMiddleOfBlock(&MBB);
 
     // Insert a comparison of the incoming target register with this block's
     // address. This also requires us to mark the block as having its address
@@ -1262,6 +1672,78 @@ static bool isEFLAGSLive(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
   return MBB.isLiveIn(X86::EFLAGS);
 }
 
+/// We trace the condition in reverse order. 
+/// Have to use an ugly function to find target conditions.
+/// Also, filter already hardened instructions
+static unsigned analyseFlagSetInstruction(MachineInstr &MI);
+static unsigned isFlagSet(MachineInstr &MI);
+static MachineInstr* mayBranch(MachineInstr &MI, 
+			       SmallPtrSet<MachineInstr *, 16> &HardenCondition) {
+  if (!MI.isConditionalBranch())
+    return nullptr;
+
+  if (!HardenOneBranchCondition && !HardenAllBranchConditions)
+    return nullptr;
+
+  MachineBasicBlock &MBB = *MI.getParent();
+  unsigned Bytes = 0;
+  for (MachineInstr &MI_tmp : llvm::reverse(MBB)) {
+    if (MI_tmp.isBranch())
+      continue;
+    // We go through implict operands and get eflags status
+    bool isEflags = false;
+    for (auto &MO : MI_tmp.implicit_operands()) {
+      if (MO.isReg() && (MO.getReg() == X86::EFLAGS)) {
+	isEflags = true;
+	break;
+      }
+    }
+    if (!isEflags)
+      continue;
+
+    //We need to filter flag set instruction
+    Bytes = isFlagSet(MI_tmp);
+    if (Bytes == 5) continue;
+    if (Bytes == 3) return nullptr;
+    
+    if (HardenCondition.count(&MI_tmp))
+      return nullptr;
+    return (MachineInstr*)&MI_tmp;
+  }
+  return nullptr;
+}
+
+unsigned isFlagSet(MachineInstr &MI)
+{
+  unsigned Opcode = MI.getOpcode();
+  switch (Opcode)
+  {
+    default: break;
+    case X86::CMP8i8: case X86::CMP16i16: case X86::CMP32i32: case X86::CMP64i32:
+      return 3;
+    case X86::CMOV16rr: case X86::CMOV16rm:
+    case X86::CMOV32rr: case X86::CMOV32rm:
+    case X86::CMOV64rr: case X86::CMOV64rm:
+    case X86::SETCCr:   case X86::SETCCm:
+      return 5;
+  }
+  return 0;
+}
+
+
+
+static unsigned analyseVariantTimingInstruction(MachineInstr &MI);
+static bool mayVariant(MachineInstr &MI)
+{
+  if (!HardenVariantTimingInstr)  
+    return false;
+  if (MI.getFlag(MachineInstr::MIFlag::NoFPExcept) || MI.mayRaiseFPException())
+    return true;
+  if (analyseVariantTimingInstruction(MI))
+    return true;
+  return false;
+}
+
 /// Trace the predicate state through each of the blocks in the function,
 /// hardening everything necessary along the way.
 ///
@@ -1291,12 +1773,25 @@ static bool isEFLAGSLive(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
 /// time to simplify reasoning about reachability and sequencing.
 void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
     MachineFunction &MF) {
+
+  if (EnableBlade) {
+    blade(MF);
+  }
+  
   SmallPtrSet<MachineInstr *, 16> HardenPostLoad;
   SmallPtrSet<MachineInstr *, 16> HardenLoadAddr;
+  SmallPtrSet<MachineInstr *, 16> HardenStoreAddr;
+  SmallPtrSet<MachineInstr *, 16> HardenCondition;
+  SmallPtrSet<MachineInstr *, 16> HardenVTInstr;
+  SmallPtrSet<MachineInstr *, 1> HardenFixedAddressRSP;
+  SmallPtrSet<MachineInstr *, 1> HardenFixedAddressRBP;
+//  SmallPtrSet<MachineInstr *, 1> HardenFixedAddressRIP;
+  bool hardened_RSP = false;
 
   SmallSet<unsigned, 16> HardenedAddrRegs;
 
   SmallDenseMap<unsigned, unsigned, 32> AddrRegToHardenedReg;
+  SmallDenseMap<unsigned, unsigned, 32> AddrRegToHardenedReg_VT;
 
   // Track the set of load-dependent registers through the basic block. Because
   // the values of these registers have an existing data dependency on a loaded
@@ -1338,13 +1833,54 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
         if (MI.getOpcode() == X86::LFENCE)
           break;
 
-        // If this instruction cannot load, nothing to do.
-        if (!MI.mayLoad())
+        // Log instructions that may load. store, branch, Variant Timing
+        MachineInstr * MI_condition = mayBranch(MI, HardenCondition);
+        if (!MI.mayLoad() && (MI_condition == nullptr) && !mayVariant(MI) 
+	      && !(HardenStoreAddress && MI.mayStore()))
           continue;
 
         // Some instructions which "load" are trivially safe or unimportant.
         if (MI.getOpcode() == X86::MFENCE)
           continue;
+
+        // Log Branch instructions, it may also meets load-harden
+        // Let the load-harden logic handle it, if we are hardenning 2 operands
+        // Then let the branch-harden handle the rest operands
+        if (MI_condition != nullptr) {
+          HardenCondition.insert(&*MI_condition);
+          
+          // Filter the case FP in Branch
+          HardenVTInstr.erase(&*MI_condition);
+        }
+
+        // Log Variant-timing Instructions, it may also meets load-harden
+        // Let the load-harden logic handle it. 
+        // We need to process X87 here
+        if (mayVariant(MI)) {
+          bool ifX87 = false;
+          for (auto &MO : MI.explicit_operands()) {
+            if (MO.isReg() && MO.getReg().isVirtual()) {
+              auto *RC = MRI->getRegClass(MO.getReg());
+              // Insert LFENCE
+              if (RC == &X86::RFP80RegClass || RC == &X86::RFP80_7RegClass) {
+                const DebugLoc &Loc = MI.getDebugLoc();
+                BuildMI(MBB, MI, Loc, TII->get(X86::LFENCE));
+                ifX87 = true;
+              }
+              break;
+            }
+          }
+         
+          if (!ifX87) {
+            HardenVTInstr.insert(&MI);
+          } else
+            break;
+        }
+
+        // Now, we want to harden or mayHarden Instruction
+        if (HardenStoreAddress && (MI.mayStore() && !MI.mayLoad())) {
+          HardenStoreAddr.insert(&MI);
+        }
 
         // Extract the memory operand information about this instruction.
         // FIXME: This doesn't handle loading pseudo instructions which we often
@@ -1376,9 +1912,23 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
         if (IndexMO.getReg() != X86::NoRegister)
           IndexReg = IndexMO.getReg();
 
-        if (!BaseReg && !IndexReg)
+        // We hijack the SLH logic to log fix-address memory loading
+        if (!BaseReg && !IndexReg) {
+          if (HardenFixedAddress) {
+            if (BaseMO.isFI()) {
+              if (HardenFixedAddressRBP.empty())
+                HardenFixedAddressRBP.insert(&MI);
+            } else if (BaseMO.getReg() == X86::RSP) {
+              hardened_RSP = true;
+              if (HardenFixedAddressRSP.empty())
+                HardenFixedAddressRSP.insert(&MI);
+            } 
+            HardenStoreAddr.erase(&MI);
+          }
+
           // No register operands!
           continue;
+        }
 
         // If any register operand is dependent, this load is dependent and we
         // needn't check it.
@@ -1401,6 +1951,7 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
             !HardenedAddrRegs.count(IndexReg)) {
           HardenPostLoad.insert(&MI);
           HardenedAddrRegs.insert(MI.getOperand(0).getReg());
+
           continue;
         }
 
@@ -1430,6 +1981,9 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
 
         // Check if this is a load whose address needs to be hardened.
         if (HardenLoadAddr.erase(&MI)) {
+          HardenStoreAddr.erase(&MI);
+          HardenOneBranchCondition && HardenCondition.count(&MI);
+
           const MCInstrDesc &Desc = MI.getDesc();
           int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
           assert(MemRefBeginIdx >= 0 && "Cannot have an invalid index here!");
@@ -1441,12 +1995,18 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
           MachineOperand &IndexMO =
               MI.getOperand(MemRefBeginIdx + X86::AddrIndexReg);
           hardenLoadAddr(MI, BaseMO, IndexMO, AddrRegToHardenedReg);
-          continue;
+          
+          if (!(HardenAllBranchConditions && HardenCondition.count(&MI)))
+            continue;
         }
 
         // Test if this instruction is one of our post load instructions (and
         // remove it from the set if so).
         if (HardenPostLoad.erase(&MI)) {
+          HardenStoreAddr.erase(&MI);
+          if (HardenOneBranchCondition && HardenCondition.count(&MI))
+            HardenCondition.erase(&MI);
+
           assert(!MI.isCall() && "Must not try to post-load harden a call!");
 
           // If this is a data-invariant load and there is no EFLAGS
@@ -1476,8 +2036,70 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
 
           // Mark the resulting hardened register as such so we don't re-harden.
           AddrRegToHardenedReg[HardenedReg] = HardenedReg;
+	  
+          // If we harden all conditions, we need to go to Branch Hardening Logic
+          if (!(HardenAllBranchConditions && HardenCondition.count(&MI)))
+            continue;
+        }
 
+        // Harden fixed Address
+        if (HardenFixedAddressRBP.erase(&MI) || HardenFixedAddressRSP.erase(&MI)) {
+            hardenFixedAddress(MI);
+	}
+        
+        // Harden the condition. 
+        if (HardenCondition.erase(&MI)) {
+          hardenBranch(MI, AddrRegToHardenedReg);
           continue;
+        }
+
+        // Harden Variant Timing Instructions
+        if (HardenVTInstr.erase(&MI)) {
+          int vt_hardened = 0;
+          Register tobeHardened = 0;
+
+          for (int VT_idx = 0; VT_idx < (int)MI.getNumOperands(); VT_idx++) {
+            auto vt_tmpOp = MI.getOperand(VT_idx);
+            if (!vt_tmpOp.isReg()) continue;
+            if (!vt_tmpOp.getReg().isVirtual()) continue;
+            if (vt_tmpOp.isDef()) continue;
+
+            // It is already hardened
+            if (AddrRegToHardenedReg.count(vt_tmpOp.getReg()))
+              continue;
+
+            if (AddrRegToHardenedReg_VT.count(vt_tmpOp.getReg())) {
+              if (AddrRegToHardenedReg_VT[vt_tmpOp.getReg()] == 1)
+                continue;
+              if (AddrRegToHardenedReg_VT[vt_tmpOp.getReg()] > 1) {
+                MI.getOperand(VT_idx).setReg(AddrRegToHardenedReg_VT[vt_tmpOp.getReg()]);
+		continue;
+	      }
+	    }
+
+            // Now Harden it
+            tobeHardened = vt_tmpOp.getReg();
+            unsigned vt_hardened = hardenVariantTimingInstr(MI,
+              AddrRegToHardenedReg_VT, VT_idx, 1);
+            if (vt_hardened)
+              AddrRegToHardenedReg_VT[tobeHardened] = vt_hardened;
+          }
+	  
+          for (MachineOperand &Def : MI.defs()) {
+            if (Def.isReg())
+              AddrRegToHardenedReg_VT[Def.getReg()] = 1; //Def.getReg();
+          }
+          continue;
+        }
+
+        // We need to manually process PUSH POP 
+        if (HardenStoreAddr.erase(&MI)) {
+          if (!hardenStore(MI)) {
+            if (!hardened_RSP) {
+              hardenFixedAddress(MI, 1);
+              hardened_RSP = true;
+            }
+          }
         }
 
         // Check for an indirect call or branch that may need its input hardened
@@ -1512,8 +2134,15 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughBlocksAndHarden(
 
     HardenPostLoad.clear();
     HardenLoadAddr.clear();
+    HardenStoreAddr.clear();
+    HardenCondition.clear();
+    HardenVTInstr.clear();
     HardenedAddrRegs.clear();
+    HardenFixedAddressRBP.clear();
+    HardenFixedAddressRSP.clear();
     AddrRegToHardenedReg.clear();
+    AddrRegToHardenedReg_VT.clear();
+    hardened_RSP = false;
 
     // Currently, we only track data-dependent loads within a basic block.
     // FIXME: We should see if this is necessary or if we could be more
@@ -1672,7 +2301,7 @@ void X86SpeculativeLoadHardeningPass::hardenLoadAddr(
     return;
 
   // Compute the current predicate state.
-  Register StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+  unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
 
   auto InsertPt = MI.getIterator();
 
@@ -1694,7 +2323,7 @@ void X86SpeculativeLoadHardeningPass::hardenLoadAddr(
     // hardening it.
     if (!Subtarget->hasVLX() && (OpRC->hasSuperClassEq(&X86::VR128RegClass) ||
                                  OpRC->hasSuperClassEq(&X86::VR256RegClass))) {
-      assert(Subtarget->hasAVX2() && "AVX2-specific register classes!");
+      //assert(Subtarget->hasAVX2() && "AVX2-specific register classes!");
       bool Is128Bit = OpRC->hasSuperClassEq(&X86::VR128RegClass);
 
       // Move our state into a vector register.
@@ -1793,10 +2422,6 @@ void X86SpeculativeLoadHardeningPass::hardenLoadAddr(
     AddrRegToHardenedReg[Op->getReg()] = TmpReg;
     Op->setReg(TmpReg);
     ++NumAddrRegsHardened;
-    ++SctNumMitigations;
-
-    if (clou::InsertTrapAfterMitigations)
-      BuildMI(MBB, InsertPt, Loc, TII->get(X86::MFENCE));
   }
 
   // And restore the flags if needed.
@@ -1947,7 +2572,7 @@ unsigned X86SpeculativeLoadHardeningPass::hardenValueInRegister(
 
   auto *RC = MRI->getRegClass(Reg);
   int Bytes = TRI->getRegSizeInBits(*RC) / 8;
-  Register StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+  unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
   assert((Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8) &&
          "Unknown register size");
 
@@ -2015,11 +2640,6 @@ unsigned X86SpeculativeLoadHardeningPass::hardenPostLoad(MachineInstr &MI) {
   MRI->replaceRegWith(/*FromReg*/ OldDefReg, /*ToReg*/ HardenedReg);
 
   ++NumPostLoadRegsHardened;
-  ++SctNumMitigations;
-
-  if (clou::InsertTrapAfterMitigations)
-    BuildMI(MBB, MI, Loc, TII->get(X86::MFENCE));
-  
   return HardenedReg;
 }
 
@@ -2112,16 +2732,12 @@ void X86SpeculativeLoadHardeningPass::tracePredStateThroughCall(
     BuildMI(MBB, std::next(InsertPt), Loc, TII->get(X86::LFENCE));
     ++NumInstsInserted;
     ++NumLFENCEsInserted;
-
-    if (clou::InsertTrapAfterMitigations)
-      BuildMI(MBB, std::next(InsertPt), Loc, TII->get(X86::MFENCE));
-    
     return;
   }
 
   // First, we transfer the predicate state into the called function by merging
   // it into the stack pointer. This will kill the current def of the state.
-  Register StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+  unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
   mergePredStateIntoSP(MBB, InsertPt, Loc, StateReg);
 
   // If this call is also a return, it is a tail call and we don't need anything
@@ -2308,10 +2924,760 @@ void X86SpeculativeLoadHardeningPass::hardenIndirectCallOrJumpInstr(
   TargetOp.setReg(HardenedTargetReg);
 
   ++NumCallsOrJumpsHardened;
-  ++SctNumMitigations;
+}
 
-  if (clou::InsertTrapAfterMitigations)
-    BuildMI(*MI.getParent(), MI, MI.getDebugLoc(), TII->get(X86::MFENCE));
+// Similar to post-load-hardening, but we don't substitute following usages
+unsigned X86SpeculativeLoadHardeningPass::hardenValueInCondition(
+  MachineBasicBlock &MBB, MachineInstr &MI, DebugLoc Loc, int OpIdx) {
+  Register oldReg =  MI.getOperand(OpIdx).getReg();
+  unsigned FlagsReg = 0;
+
+  if (isEFLAGSLive(MBB, MI, *TRI))
+    FlagsReg = saveEFLAGS(MBB, MI, Loc);
+
+  auto *RC = MRI->getRegClass(oldReg);
+  int Bytes = TRI->getRegSizeInBits(*RC) / 8;
+  unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+  assert((Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8) && "Unknown register size");
+  if (Bytes != 8) {
+    unsigned SubRegImms[] = {X86::sub_8bit, X86::sub_16bit, X86::sub_32bit};
+    unsigned SubRegImm = SubRegImms[Log2_32(Bytes)];
+    Register NarrowStateReg = MRI->createVirtualRegister(MRI->getRegClass(oldReg));
+    BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), NarrowStateReg)
+        .addReg(StateReg, 0, SubRegImm);
+    StateReg = NarrowStateReg;
+  }
+  
+  Register HardenedReg = MRI->createVirtualRegister(RC);
+  unsigned OrOpCodes[] = {X86::OR8rr, X86::OR16rr, X86::OR32rr, X86::OR64rr};
+  unsigned OrOpCode = OrOpCodes[Log2_32(Bytes)];
+  auto OrI = BuildMI(MBB, MI, Loc, TII->get(OrOpCode), HardenedReg)
+		      .addReg(oldReg).addReg(StateReg);
+  OrI->addRegisterDead(X86::EFLAGS, TRI);
+  MI.getOperand(OpIdx).setReg(HardenedReg);
+
+  if (FlagsReg)
+    restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+  return HardenedReg;
+}
+
+// Harden the Branches
+// Harden registers, unfold the fix-address memory load / write
+unsigned X86SpeculativeLoadHardeningPass::hardenBranch(MachineInstr &MI, 
+		    SmallDenseMap<unsigned, unsigned, 32> &AddrRegToHardenedReg) {
+  int hardened = 0;
+  MachineBasicBlock &MBB = *MI.getParent();
+  const DebugLoc &Loc = MI.getDebugLoc();
+
+  for (int i = 0; i < (int)MI.getNumOperands(); i++) {
+    if (!MI.getOperand(i).isReg()) continue;
+    if (MI.getOperand(i).isDef()) continue; 
+    Register reg_tmp = MI.getOperand(i).getReg(); 
+    // FIXME We can't harden gr64_norex, see function canHardenRegister
+    if (MI.getFlag(MachineInstr::MIFlag::NoFPExcept) || MI.mayRaiseFPException()) {
+      if (hardenVariantTimingInstr(MI, AddrRegToHardenedReg, i, 1))
+        hardened += 1;
+    }
+    else if (!(reg_tmp.isVirtual() && canHardenRegister(reg_tmp))) 
+      continue;
+    else if (AddrRegToHardenedReg.count(reg_tmp)) {
+      hardened += 1;
+    } else {
+      // It has not been hardened before, let's harden it
+      unsigned success = hardenValueInCondition(MBB, MI, Loc, i);
+      assert(success && "Failed to harden a register in Condition!");
+      hardened += 1;
+    }
+
+    if (HardenOneBranchCondition && hardened != 0)
+      return hardened;
+  }
+
+  // At most, three registers could be hardened, 2 for memory operations and 1 for register
+  if (hardened > 2)
+    return hardened;
+
+
+  // Now, we need to unfold memory load / write
+  // If the fix addresses are already hardened, then we do nothing here
+  if (HardenFixedAddress)
+    return 1;
+
+  // FIXME We can't harden gr64_norex, see function canHardenRegister
+  if (!MI.mayLoadOrStore()) {
+    if( hardened == 0 && !canHardenRegister(MI.getOperand(0).getReg()))
+      return 1;
+    return hardened; 
+  }
+
+  
+  if (!MI.mayStore()) {
+    // Unfold Memoryoperand
+    unsigned LoadRegIndex;
+    unsigned newCmpOpCode = TII->getOpcodeAfterMemoryUnfold(MI.getOpcode(),
+				    true, false, &LoadRegIndex);
+    unsigned oldOpCode = MI.getOpcode();
+    const MCInstrDesc &MID = TII->get(newCmpOpCode);
+    MachineFunction &MF = *MI.getMF();
+    const TargetRegisterClass *RC = TII->getRegClass(MID, LoadRegIndex, TRI, MF);
+    SmallVector<MachineInstr *, 2> NewMIs;
+    Register newReg = MRI->createVirtualRegister(RC);
+    TII->unfoldMemoryOperand(MF, MI, newReg, true, false, NewMIs);
+
+    // Insert Load instruction, Harden the register, and update target Instr
+    MBB.insert(MachineBasicBlock::iterator(MI), NewMIs[0]);
+    
+    MachineInstr &MI_unfolded = *std::prev(MI.getIterator());
+    auto &DefOpRef = MI_unfolded.getOperand(0);
+    Register OldReg = DefOpRef.getReg();
+
+    unsigned FlagsReg = 0;
+    if (isEFLAGSLive(MBB, MI, *TRI))
+      FlagsReg = saveEFLAGS(MBB, MI, Loc);
+
+    auto *RC2 = MRI->getRegClass(OldReg);
+    int Bytes = TRI->getRegSizeInBits(*RC2) / 8;
+    unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+    assert((Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8) && "Unknown register size");
+    // FIXME: Need to teach this about 32-bit mode.
+    if (Bytes != 8 && (oldOpCode != X86::VUCOMISSrm && oldOpCode != X86::VCOMISSrm)) {
+      unsigned SubRegImms[] = {X86::sub_8bit, X86::sub_16bit, X86::sub_32bit};
+      unsigned SubRegImm = SubRegImms[Log2_32(Bytes)];
+      Register NarrowStateReg = MRI->createVirtualRegister(MRI->getRegClass(OldReg));
+      BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), NarrowStateReg)
+	  .addReg(StateReg, 0, SubRegImm);
+      StateReg = NarrowStateReg;
+    }
+
+    Register HardenedReg = MRI->createVirtualRegister(RC2);
+
+    // We need to explicitly handle the floating point memory read, the reason is that
+    // in practice, sometimes it may have faults if we load the fp value into general registers.
+    // It makes the implementation a little ugly.
+    if (oldOpCode != X86::VUCOMISSrm && oldOpCode != X86::VCOMISSrm) {
+      unsigned OrOpCodes[] = {X86::OR8rr, X86::OR16rr, X86::OR32rr, X86::OR64rr};
+      unsigned OrOpCode = OrOpCodes[Log2_32(Bytes)];
+      auto OrI = BuildMI(MBB, MI, Loc, TII->get(OrOpCode), HardenedReg)
+			.addReg(OldReg).addReg(StateReg);
+      OrI->addRegisterDead(X86::EFLAGS, TRI);
+    } else {
+      Register generalReg = (RC2 == &X86::FR32RegClass) ?
+        MRI->createVirtualRegister(&X86::GR32RegClass) : 
+        MRI->createVirtualRegister(&X86::GR64RegClass);
+      Register newReg = (RC2 == &X86::FR32RegClass) ?
+        MRI->createVirtualRegister(&X86::GR32RegClass) : 
+        MRI->createVirtualRegister(&X86::GR64RegClass); 
+
+      BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), generalReg).addReg(OldReg);
+      if (Bytes != 8) {
+        unsigned SubRegImms[] = {X86::sub_8bit, X86::sub_16bit, X86::sub_32bit};
+        unsigned SubRegImm = SubRegImms[Log2_32(Bytes)];
+        Register NarrowStateReg = MRI->createVirtualRegister(MRI->getRegClass(generalReg));
+        BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), NarrowStateReg)
+              .addReg(StateReg, 0, SubRegImm);
+        StateReg = NarrowStateReg;
+      }
+      unsigned OrOpCode = (RC2 == &X86::FR32RegClass) ? X86::OR32rr : X86::OR64rr;
+      auto OrI = BuildMI(MBB, MI, Loc, TII->get(OrOpCode), newReg).addReg(generalReg).addReg(StateReg);
+      OrI->addRegisterDead(X86::EFLAGS, TRI);
+      BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), HardenedReg).addReg(newReg);
+    }
+
+    if (FlagsReg)
+      restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+
+    // Now, we need to update the old branching instruction. Due to the role of it in CFG,
+    // We can simply erase them at the backend, so we manually update each operand.
+    int removeIndex = 0;
+    const MCInstrDesc &Desc = MI.getDesc();
+    int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
+    MachineOperand &BaseMO = MI.getOperand(MemRefBeginIdx + X86::AddrBaseReg);
+    removeIndex = MI.getOperandNo((MachineInstr::const_mop_iterator)&BaseMO);
+
+    if (MI.getOperand(0).isReg() && MI.getOperand(0).isDef() && MI.getOperand(0).getReg().isVirtual())
+      removeIndex = 2;
+
+    // Manually update the target instruction, get rid of memory operantion 
+    // and replace it with a masked virtual register
+    for (int i = removeIndex; i < (removeIndex+4); i++)
+      MI.RemoveOperand(removeIndex);
+    assert(MI.getOperand(removeIndex).isReg() && "Hey HardenedReg is not a reg!!!");
+
+      MI.getOperand(removeIndex).setReg(HardenedReg);
+    
+    MI.setDesc(TII->get(newCmpOpCode));
+    MI.dropDebugNumber();
+    MI.dropMemRefs(MF);
+
+    if (HardenedReg)
+      hardened += 1;
+    return hardened;
+  } else {
+    MachineFunction &MF = *MI.getMF();
+    unsigned FlagsReg = 0;
+    if (isEFLAGSLive(MBB, MI, *TRI))
+      FlagsReg = saveEFLAGS(MBB, MI, Loc); 
+
+    // When unfolding an instruction, we need to know its operands size.
+    // However, in LLVM, it cannot be told correctly, so we need to maintain a table to get the size of instructions
+    unsigned Bytes = analyseFlagSetInstruction(MI);
+    unsigned OrOpCodes[] = {X86::OR8mr, X86::OR16mr, X86::OR32mr, X86::OR64mr};
+    const TargetRegisterClass *GPRRegClasses[] = {
+      &X86::GR8RegClass, &X86::GR16RegClass, &X86::GR32RegClass,
+      &X86::GR64RegClass};
+    unsigned OrOpCode = OrOpCodes[Log2_32(Bytes)];
+
+    unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+    assert((Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8) && "Unknown register size");
+    // FIXME: Need to teach this about 32-bit mode.
+    if (Bytes != 8) {
+      unsigned SubRegImms[] = {X86::sub_8bit, X86::sub_16bit, X86::sub_32bit};
+      unsigned SubRegImm = SubRegImms[Log2_32(Bytes)];
+      Register NarrowStateReg = MRI->createVirtualRegister(GPRRegClasses[Log2_32(Bytes)]);
+      BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), NarrowStateReg)
+	  .addReg(StateReg, 0, SubRegImm);
+      StateReg = NarrowStateReg;
+    }
+
+    MachineInstr* OrI = BuildMI(MBB, MI, Loc, TII->get(OrOpCode));
+    OrI->addRegisterDead(X86::EFLAGS, TRI);
+    for (int i = 0; i < 5; i++)
+      OrI->addOperand(MI.getOperand(i));
+    OrI->addOperand(MachineOperand::CreateReg(StateReg, false));
+    OrI->cloneMemRefs(MF, MI);
+    if (FlagsReg)
+      restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+    
+    hardened += 1;
+    return hardened;
+  }
+  
+  return 0;
+}
+
+// Harden variant timing instructions.
+// We need to handle 32,64 bits fpReg, and 128,256,512 vectors(Reuse the logic from SLH).
+// If Special is set, we only check one operand, otherwise, we go through all operands
+unsigned X86SpeculativeLoadHardeningPass::hardenVariantTimingInstr(MachineInstr &MI, 
+		      SmallDenseMap<unsigned, unsigned, 32> &AddrRegToHardenedReg,
+		      int idx, int special) {
+  MachineBasicBlock &MBB = *MI.getParent();
+  const DebugLoc &Loc = MI.getDebugLoc();
+
+  for (int OpIdx = 0; OpIdx < (int)MI.getNumOperands(); OpIdx++) {
+    if (special)  OpIdx = idx;
+    if (!MI.getOperand(OpIdx).isReg()) {
+      if (special)  return 0; else continue;
+    }
+    Register Reg = MI.getOperand(OpIdx).getReg();
+    if (!Reg.isVirtual() || MI.getOperand(OpIdx).isDef()) { 
+      if (special) return 0; else continue;
+    }
+    auto *RC = MRI->getRegClass(Reg);
+    int RegBytes = TRI->getRegSizeInBits(*RC) / 8;
+    unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+  
+    // Harden FP operations, reuse the SLH logic for vector hardening
+    if (MI.getFlag(MachineInstr::MIFlag::NoFPExcept) || MI.mayRaiseFPException()) {
+      if ((RC != &X86::FR32RegClass) && (RC != &X86::FR64RegClass) && 
+      !(RC->hasSuperClassEq(&X86::VR128RegClass) ||
+        RC->hasSuperClassEq(&X86::VR256RegClass) || RC->hasSuperClassEq(&X86::VR512RegClass))  ) {
+        return 1;
+      }
+
+      if (!Subtarget->hasVLX() && (RC->hasSuperClassEq(&X86::VR128RegClass) ||
+                                 RC->hasSuperClassEq(&X86::VR256RegClass))) {
+
+      //assert(Subtarget->hasAVX2() && "AVX2-specific register classes!");
+      bool Is128Bit = RC->hasSuperClassEq(&X86::VR128RegClass);
+
+      bool EFLAGSLive = isEFLAGSLive(MBB, MI.getIterator(), *TRI);
+      unsigned FlagsReg = 0;
+      if (EFLAGSLive && !Subtarget->hasBMI2()) {
+        EFLAGSLive = false;
+        FlagsReg = saveEFLAGS(MBB, MI, Loc);
+      }
+
+      Register HardenedReg = MRI->createVirtualRegister(RC);
+
+      // Move our state into a vector register.
+      // FIXME: We could skip this at the cost of longer encodings with AVX-512
+      // but that doesn't seem likely worth it.
+      Register VStateReg = MRI->createVirtualRegister(&X86::VR128RegClass);
+      auto MovI =
+          BuildMI(MBB, MI, Loc, TII->get(X86::VMOV64toPQIrr), VStateReg)
+              .addReg(StateReg);
+      (void)MovI;
+
+      LLVM_DEBUG(dbgs() << "  Inserting mov: "; MovI->dump(); dbgs() << "\n");
+
+      // Broadcast it across the vector register.
+      Register VBStateReg = MRI->createVirtualRegister(RC);
+      auto BroadcastI = BuildMI(MBB, MI, Loc,
+                                TII->get(Is128Bit ? X86::VPBROADCASTQrr
+                                                  : X86::VPBROADCASTQYrr),
+                                VBStateReg)
+                            .addReg(VStateReg);
+      (void)BroadcastI;
+
+      LLVM_DEBUG(dbgs() << "  Inserting broadcast: "; BroadcastI->dump();
+                 dbgs() << "\n");
+
+      // Merge our potential poison state into the value with a vector or.
+      auto OrI =
+          BuildMI(MBB, MI, Loc,
+                  TII->get(Is128Bit ? X86::VPORrr : X86::VPORYrr), HardenedReg)
+              .addReg(VBStateReg)
+              .addReg(Reg);
+      (void)OrI;
+
+      LLVM_DEBUG(dbgs() << "  Inserting or: "; OrI->dump(); dbgs() << "\n");
+      MI.getOperand(OpIdx).setReg(HardenedReg);
+      if (FlagsReg)
+        restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+      return HardenedReg;
+    } else if (RC->hasSuperClassEq(&X86::VR128XRegClass) ||
+               RC->hasSuperClassEq(&X86::VR256XRegClass) ||
+               RC->hasSuperClassEq(&X86::VR512RegClass)) {
+
+      assert(Subtarget->hasAVX512() && "AVX512-specific register classes!");
+      bool Is128Bit = RC->hasSuperClassEq(&X86::VR128XRegClass);
+      bool Is256Bit = RC->hasSuperClassEq(&X86::VR256XRegClass);
+      if (Is128Bit || Is256Bit)
+        assert(Subtarget->hasVLX() && "AVX512VL-specific register classes!");
+
+      bool EFLAGSLive = isEFLAGSLive(MBB, MI.getIterator(), *TRI);
+      unsigned FlagsReg = 0;
+      if (EFLAGSLive && !Subtarget->hasBMI2()) {
+        EFLAGSLive = false;
+        FlagsReg = saveEFLAGS(MBB, MI, Loc);
+      }
+      Register HardenedReg = MRI->createVirtualRegister(RC);
+
+      // Broadcast our state into a vector register.
+      Register VStateReg = MRI->createVirtualRegister(RC);
+      unsigned BroadcastOp = Is128Bit ? X86::VPBROADCASTQrZ128rr
+                                      : Is256Bit ? X86::VPBROADCASTQrZ256rr
+                                                 : X86::VPBROADCASTQrZrr;
+      auto BroadcastI =
+          BuildMI(MBB, MI, Loc, TII->get(BroadcastOp), VStateReg)
+              .addReg(StateReg);
+      (void)BroadcastI;
+      
+      LLVM_DEBUG(dbgs() << "  Inserting broadcast: "; BroadcastI->dump();
+                 dbgs() << "\n");
+
+      // Merge our potential poison state into the value with a vector or.
+      unsigned OrOp = Is128Bit ? X86::VPORQZ128rr
+                               : Is256Bit ? X86::VPORQZ256rr : X86::VPORQZrr;
+      auto OrI = BuildMI(MBB, MI, Loc, TII->get(OrOp), HardenedReg)
+                     .addReg(VStateReg)
+                     .addReg(Reg);
+      (void)OrI;
+      
+      
+      MI.getOperand(OpIdx).setReg(HardenedReg);
+      if (FlagsReg)
+        restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+      LLVM_DEBUG(dbgs() << "  Inserting or: "; OrI->dump(); dbgs() << "\n");
+      return HardenedReg;
+    } 
+
+      Register generalReg = (RC == &X86::FR32RegClass) ?
+        MRI->createVirtualRegister(&X86::GR32RegClass) : 
+        MRI->createVirtualRegister(&X86::GR64RegClass);
+      Register newReg = (RC == &X86::FR32RegClass) ?
+        MRI->createVirtualRegister(&X86::GR32RegClass) : 
+        MRI->createVirtualRegister(&X86::GR64RegClass);
+
+      unsigned FlagsReg = 0;
+      if (isEFLAGSLive(MBB, MI, *TRI))
+	      FlagsReg = saveEFLAGS(MBB, MI, Loc);
+      BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), generalReg).addReg(Reg);
+    
+      // FIXME: Need to teach this about 32-bit mode.
+      if (RegBytes != 8) {
+        unsigned SubRegImms[] = {X86::sub_8bit, X86::sub_16bit, X86::sub_32bit};
+        unsigned SubRegImm = SubRegImms[Log2_32(RegBytes)];
+        Register NarrowStateReg = MRI->createVirtualRegister(MRI->getRegClass(generalReg));
+        BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), NarrowStateReg)
+              .addReg(StateReg, 0, SubRegImm);
+        StateReg = NarrowStateReg;
+      }
+
+      unsigned OrOpCode = (RC == &X86::FR32RegClass) ? X86::OR32rr : X86::OR64rr;
+      BuildMI(MBB, MI, Loc, TII->get(OrOpCode), newReg)
+			  .addReg(generalReg)
+			  .addReg(StateReg);
+      Register HardenedReg = MRI->createVirtualRegister(MRI->getRegClass(Reg));
+      BuildMI(MBB, MI, Loc, TII->get(TargetOpcode::COPY), HardenedReg)
+	    .addReg(newReg);
+      MI.getOperand(OpIdx).setReg(HardenedReg);
+
+      if (FlagsReg)
+        restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+  
+      return HardenedReg;
+    } else if (analyseVariantTimingInstruction(MI) == 1) {
+      unsigned FlagsReg = 0;
+      if (isEFLAGSLive(MBB, MI, *TRI))
+        FlagsReg = saveEFLAGS(MBB, MI, Loc);
+      
+      auto OrI = BuildMI(MBB, MI, Loc, TII->get(X86::OR64rr), X86::RCX)
+			  .addReg(X86::RCX, RegState::Undef)
+			  .addReg(StateReg);
+      OrI->addRegisterDead(X86::EFLAGS, TRI);
+
+      if (FlagsReg)
+        restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+      return 1;
+    } else if (analyseVariantTimingInstruction(MI) == 2) {
+      if (!canHardenRegister(Reg))  continue;
+      if (AddrRegToHardenedReg.count(Reg))  return 1;
+      unsigned success = hardenValueInCondition(MBB, MI, Loc, OpIdx);
+      if (!success) continue;
+      return 1;
+    }
+  }
+
+  // If nothing is hardened, we need to harden the fixed-address 
+  // If hardenFixedAddress is set, it should already be hardened, 
+  // otherwise, we need to harden it.
+  if (HardenFixedAddress)
+    return 1;
+  else {
+    hardenFixedAddress(MI);
+    return 1;
+  }
+
+  return 0;  
+}
+
+// Harden fixed address(RSP, RBP)
+unsigned X86SpeculativeLoadHardeningPass::hardenFixedAddress(MachineInstr &MI, int special)
+{
+  unsigned hardened = 0;
+  MachineBasicBlock &MBB = *MI.getParent();
+  const DebugLoc &Loc = MI.getDebugLoc();
+  unsigned StateReg = PS->SSA.GetValueAtEndOfBlock(&MBB);
+  unsigned FlagsReg = 0;
+  if (isEFLAGSLive(MBB, MI, *TRI))
+    FlagsReg = saveEFLAGS(MBB, MI, Loc);
+  MachineInstr* OrI;
+
+  // handle push, pop
+  if (special) {
+    OrI = BuildMI(MBB, MI, Loc, TII->get(X86::OR64rr), X86::RSP)
+		      .addReg(X86::RSP, RegState::Undef)
+		      .addReg(StateReg);
+  } else {
+    const MCInstrDesc &Desc = MI.getDesc();
+    int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
+    MemRefBeginIdx += X86II::getOperandBias(Desc);
+    MachineOperand &BaseMO =  MI.getOperand(MemRefBeginIdx + X86::AddrBaseReg);
+ 
+    if (BaseMO.isFI()) {
+      OrI = BuildMI(MBB, MI, Loc, TII->get(X86::OR64rr), X86::RBP)
+                        .addReg(X86::RBP, RegState::Undef)
+                        .addReg(StateReg);
+      hardened = 1;
+    } else if (BaseMO.isReg() && BaseMO.getReg() == X86::RSP) {
+      OrI = BuildMI(MBB, MI, Loc, TII->get(X86::OR64rr), X86::RSP)
+                        .addReg(X86::RSP, RegState::Undef)
+                        .addReg(StateReg);
+      hardened = 1;
+    } 
+#if 0
+    else if (BaseMO.isReg() && 
+	    (BaseMO.getReg() == X86::RIP || BaseMO.getReg() == X86::NoRegister)) {
+      // DO NOT HARDEN RIP
+      OrI = BuildMI(MBB, MI, Loc, TII->get(X86::OR64rr), X86::RIP)
+                        .addReg(X86::RIP, RegState::Undef)
+                        .addReg(StateReg);
+      hardened = 1;
+    } 
+#endif
+
+  }
+  OrI->addRegisterDead(X86::EFLAGS, TRI);
+  if (FlagsReg)
+      restoreEFLAGS(MBB, MI, Loc, FlagsReg);
+  return 1;
+}
+
+// Harden Store Instruction. The store address is hardened
+unsigned X86SpeculativeLoadHardeningPass::hardenStore(MachineInstr &MI) {
+  MachineBasicBlock &MBB = *MI.getParent();
+  const DebugLoc &Loc = MI.getDebugLoc();
+
+  const MCInstrDesc &Desc = MI.getDesc();
+  int MemRefBeginIdx = X86II::getMemoryOperandNo(Desc.TSFlags);
+  if (MemRefBeginIdx < 0) {
+    return 0;	
+  }
+
+  MemRefBeginIdx += X86II::getOperandBias(Desc);
+
+  MachineOperand &BaseMO = MI.getOperand(MemRefBeginIdx + X86::AddrBaseReg);
+  MachineOperand &IndexMO = MI.getOperand(MemRefBeginIdx + X86::AddrIndexReg);
+
+  unsigned BaseReg = 0, IndexReg = 0;
+  if (!BaseMO.isFI() && BaseMO.getReg() != X86::RIP && BaseMO.getReg() != X86::NoRegister)
+    BaseReg = BaseMO.getReg();
+  if (IndexMO.getReg() != X86::NoRegister) 
+    IndexReg = IndexMO.getReg();
+
+  unsigned tobeHarden = 0;
+  if (BaseReg && BaseMO.getReg().isVirtual() && canHardenRegister(BaseMO.getReg()))
+    tobeHarden += 1;
+  if (IndexReg && IndexMO.getReg().isVirtual() && canHardenRegister(IndexMO.getReg()))
+    tobeHarden += 1;
+  
+  unsigned hardened = 0;
+  for ( int i = 0; i < (int)MI.getNumOperands(); i++) {
+    if (!MI.getOperand(i).isReg())  continue;
+    if (MI.getOperand(i).isDef()) continue;
+    Register reg_tmp = MI.getOperand(i).getReg();
+    if (!(reg_tmp.isVirtual() && canHardenRegister(reg_tmp)))
+      continue;
+    if (hardenValueInCondition(MBB, MI, Loc, i))
+      hardened += 1;
+    if (hardened == tobeHarden)
+      return 1;
+  }
+  return 0;
+}
+
+// Analyse the variant Timing Instructions.
+// REPEAT instruction and DIV64
+static unsigned analyseVariantTimingInstruction(MachineInstr &MI)
+{
+  unsigned Opcode = MI.getOpcode();
+  switch (Opcode)
+  {
+    default: break;
+    
+    // Need to Harden RCX
+    case X86::REP_MOVSB_32:  case X86::REP_MOVSW_32:  case X86::REP_MOVSD_32:
+    case X86::REP_MOVSQ_32:  case X86::REP_MOVSB_64:  case X86::REP_MOVSW_64:
+    case X86::REP_MOVSD_64:  case X86::REP_MOVSQ_64:  case X86::REP_STOSB_32:
+    case X86::REP_STOSW_32:  case X86::REP_STOSD_32:  case X86::REP_STOSQ_32:
+    case X86::REP_STOSB_64:  case X86::REP_STOSW_64:  case X86::REP_STOSD_64:
+    case X86::REP_STOSQ_64:  case X86::REP_PREFIX:    case X86::REPNE_PREFIX:
+      printf("ATTENTION\n"); 
+      return 1;
+    
+    // Harden the value
+    case X86::DIV64r:  case X86::IDIV64r:
+      return 2;
+  }
+  return 0;
+}
+
+// Tell the size of operand based on OPCODE
+// LLVM cannot return operand size(from opCode )properly, we need to manually do it.
+// Currently, all instructions that appear in SPEC are logged, there might be instructions that are not logged
+static unsigned analyseFlagSetInstruction(MachineInstr &MI)
+{
+  unsigned Opcode = MI.getOpcode();
+  switch (Opcode)
+  {
+    default: break;
+
+    // Analyze Compare
+    case X86::CMP8rr: case X86::CMP8ri: case X86::CMP8ri8:  case X86::CMP8mi: case X86::CMP8mi8:  case X86::CMP8mr: case X86::CMP8rm:
+      return 1;
+    case X86::CMP16rr: case X86::CMP16ri: case X86::CMP16ri8:  case X86::CMP16mi: case X86::CMP16mi8:  case X86::CMP16mr: case X86::CMP16rm:
+      return 2;
+    case X86::CMP32rr: case X86::CMP32ri: case X86::CMP32ri8:  case X86::CMP32mi: case X86::CMP32mi8:  case X86::CMP32mr: case X86::CMP32rm:
+      return 4;
+    case X86::CMP64rr: case X86::CMP64ri32: case X86::CMP64ri8:  case X86::CMP64mi32: case X86::CMP64mi8:  case X86::CMP64mr: case X86::CMP64rm:
+      return 8;
+
+    // Analyze TEST
+    case X86::TEST8rr:  case X86::TEST8ri:   case X86::TEST8mi:  case X86::TEST8mr:
+      return 1;
+    case X86::TEST16rr: case X86::TEST16ri:  case X86::TEST16mi:  case X86::TEST16mr:
+      return 2;
+    case X86::TEST32rr: case X86::TEST32ri:  case X86::TEST32mi:  case X86::TEST32mr:
+      return 4;
+    case X86::TEST64rr: case X86::TEST64ri32:  case X86::TEST64mr: case X86::TEST64mi32:
+      return 8;
+
+    // Analyze BIT TEST
+    case X86::BT16rr: case X86::BT16ri8:  case X86::BT16mr:  case X86::BT16mi8:
+      return 2;
+    case X86::BT32rr: case X86::BT32ri8:  case X86::BT32mr:  case X86::BT32mi8:
+      return 4;
+    case X86::BT64rr: case X86::BT64ri8:  case X86::BT64mr:  case X86::BT64mi8:
+      return 8;
+
+    // Analyze OR
+    case X86::OR8rr: case X86::OR8ri: case X86::OR8ri8:  case X86::OR8mi: case X86::OR8mi8:  case X86::OR8mr: case X86::OR8rm:
+      return 1;
+    case X86::OR16rr: case X86::OR16ri: case X86::OR16ri8:  case X86::OR16mi: case X86::OR16mi8:  case X86::OR16mr: case X86::OR16rm:
+      return 2;
+    case X86::OR32rr: case X86::OR32ri: case X86::OR32ri8:  case X86::OR32mi: case X86::OR32mi8:  case X86::OR32mr: case X86::OR32rm:
+      return 4;
+    case X86::OR64rr: case X86::OR64ri32: case X86::OR64ri8:  case X86::OR64mi32: case X86::OR64mi8:  case X86::OR64mr: case X86::OR64rm:
+      return 8;
+
+    // Analyze AND
+    case X86::AND8rr: case X86::AND8ri: case X86::AND8ri8:  case X86::AND8mi: case X86::AND8mi8:  case X86::AND8mr: case X86::AND8rm:
+      return 1;
+    case X86::AND16rr: case X86::AND16ri: case X86::AND16ri8:  case X86::AND16mi: case X86::AND16mi8:  case X86::AND16mr: case X86::AND16rm:
+      return 2;
+    case X86::AND32rr: case X86::AND32ri: case X86::AND32ri8:  case X86::AND32mi: case X86::AND32mi8:  case X86::AND32mr: case X86::AND32rm:
+    case X86::ANDN32rr: case X86::ANDN32rm:
+      return 4;
+    case X86::AND64rr:  case X86::AND64ri32: case X86::AND64ri8:  case X86::AND64mi32: case X86::AND64mi8:  case X86::AND64mr: case X86::AND64rm:
+    case X86::ANDN64rr: case X86::ANDN64rm:
+      return 8;
+
+    // Analyze XOR
+    case X86::XOR8rr: case X86::XOR8ri: case X86::XOR8ri8:  case X86::XOR8mi: case X86::XOR8mi8:  case X86::XOR8mr: case X86::XOR8rm:
+      return 1;
+    case X86::XOR16rr: case X86::XOR16ri: case X86::XOR16ri8:  case X86::XOR16mi: case X86::XOR16mi8:  case X86::XOR16mr: case X86::XOR16rm:
+      return 2;
+    case X86::XOR32rr: case X86::XOR32ri: case X86::XOR32ri8:  case X86::XOR32mi: case X86::XOR32mi8:  case X86::XOR32mr: case X86::XOR32rm:
+      return 4;
+    case X86::XOR64rr: case X86::XOR64ri32: case X86::XOR64ri8:  case X86::XOR64mi32: case X86::XOR64mi8:  case X86::XOR64mr: case X86::XOR64rm:
+      return 8;
+
+    // Analyze ADD
+    case X86::ADD8rr: case X86::ADD8ri: case X86::ADD8ri8:  case X86::ADD8mi: case X86::ADD8mi8:  case X86::ADD8mr: case X86::ADD8rm:
+      return 1;
+    case X86::ADD16rr: case X86::ADD16ri: case X86::ADD16ri8:  case X86::ADD16mi: case X86::ADD16mi8:  case X86::ADD16mr: case X86::ADD16rm:
+      return 2;
+    case X86::ADD32rr: case X86::ADD32ri: case X86::ADD32ri8:  case X86::ADD32mi: case X86::ADD32mi8:  case X86::ADD32mr: case X86::ADD32rm:
+      return 4;
+    case X86::ADD64rr: case X86::ADD64ri32: case X86::ADD64ri8:  case X86::ADD64mi32: case X86::ADD64mi8:  case X86::ADD64mr: case X86::ADD64rm:
+      return 8;
+
+    // Analyze ADD with CARRY
+    case X86::ADC8rr: case X86::ADC8ri: case X86::ADC8ri8:  case X86::ADC8mi: case X86::ADC8mi8:  case X86::ADC8mr: case X86::ADC8rm:
+      return 1;
+    case X86::ADC16rr: case X86::ADC16ri: case X86::ADC16ri8:  case X86::ADC16mi: case X86::ADC16mi8:  case X86::ADC16mr: case X86::ADC16rm:
+      return 2;
+    case X86::ADC32rr: case X86::ADC32ri: case X86::ADC32ri8:  case X86::ADC32mi: case X86::ADC32mi8:  case X86::ADC32mr: case X86::ADC32rm:
+      return 4;
+    case X86::ADC64rr: case X86::ADC64ri32: case X86::ADC64ri8:  case X86::ADC64mi32: case X86::ADC64mi8:  case X86::ADC64mr: case X86::ADC64rm:
+      return 8;
+
+    // Analyze SUB
+    case X86::SUB8rr: case X86::SUB8ri: case X86::SUB8ri8:  case X86::SUB8mi: case X86::SUB8mi8:  case X86::SUB8mr: case X86::SUB8rm:
+      return 1;
+    case X86::SUB16rr: case X86::SUB16ri: case X86::SUB16ri8:  case X86::SUB16mi: case X86::SUB16mi8:  case X86::SUB16mr: case X86::SUB16rm:
+      return 2;
+    case X86::SUB32rr: case X86::SUB32ri: case X86::SUB32ri8:  case X86::SUB32mi: case X86::SUB32mi8:  case X86::SUB32mr: case X86::SUB32rm:
+      return 4;
+    case X86::SUB64rr: case X86::SUB64ri32: case X86::SUB64ri8:  case X86::SUB64mi32: case X86::SUB64mi8:  case X86::SUB64mr: case X86::SUB64rm:
+      return 8;
+
+    // Analyze SUB with Borrow
+    case X86::SBB8rr: case X86::SBB8ri: case X86::SBB8ri8:  case X86::SBB8mi: case X86::SBB8mi8:  case X86::SBB8mr: case X86::SBB8rm:
+      return 1;
+    case X86::SBB16rr: case X86::SBB16ri: case X86::SBB16ri8:  case X86::SBB16mi: case X86::SBB16mi8:  case X86::SBB16mr: case X86::SBB16rm:
+      return 2;
+    case X86::SBB32rr: case X86::SBB32ri: case X86::SBB32ri8:  case X86::SBB32mi: case X86::SBB32mi8:  case X86::SBB32mr: case X86::SBB32rm:
+      return 4;
+    case X86::SBB64rr: case X86::SBB64ri32: case X86::SBB64ri8:  case X86::SBB64mi32: case X86::SBB64mi8:  case X86::SBB64mr: case X86::SBB64rm:
+      return 8;
+
+    // Analyze ADCX and ADOX
+    case X86::ADCX32rr: case X86::ADCX32rm: case X86::ADOX32rr: case X86::ADOX32rm:
+      return 4;
+    case X86::ADCX64rr: case X86::ADCX64rm: case X86::ADOX64rr: case X86::ADOX64rm:
+      return 8;
+
+    // Analyze MUL and IMUL
+    case X86::MUL8r:  case X86::MUL8m:  case X86::IMUL8r: case X86::IMUL8m:
+      return 1;
+    case X86::MUL16r: case X86::MUL16m: case X86::IMUL16r:  case X86::IMUL16rr: case X86::IMUL16rm: case X86::IMUL16rri:  case X86::IMUL16rri8: case X86::IMUL16rmi:  case X86::IMUL16rmi8:
+      return 2;
+    case X86::MUL32r: case X86::MUL32m: case X86::IMUL32r:  case X86::IMUL32rr: case X86::IMUL32rm: case X86::IMUL32rri:  case X86::IMUL32rri8: case X86::IMUL32rmi:  case X86::IMUL32rmi8:
+      return 4;
+    case X86::MUL64r: case X86::MUL64m: case X86::IMUL64r:  case X86::IMUL64rr: case X86::IMUL64rm: case X86::IMUL64rri32:  case X86::IMUL64rri8: case X86::IMUL64rmi32:  case X86::IMUL64rmi8:
+      return 8;
+
+    // Analyze DIV and IDIV
+    case X86::DIV8r:  case X86::DIV8m:  case X86::IDIV8r: case X86::IDIV8m:
+      return 1;
+    case X86::DIV16r: case X86::DIV16m: case X86::IDIV16r:
+      return 2;
+    case X86::DIV32r: case X86::DIV32m: case X86::IDIV32r:
+      return 4;
+    case X86::DIV64r: case X86::DIV64m: case X86::IDIV64r:
+      return 8;
+
+    // Analyze INC and DEC
+    case X86::INC8r:  case X86::INC8m:  case X86::DEC8r:  case X86::DEC8m:
+      return 1;
+    case X86::INC16r: case X86::INC16m:  case X86::DEC16r:  case X86::DEC16m:
+      return 2;
+    case X86::INC32r: case X86::INC32m:  case X86::DEC32r:  case X86::DEC32m:
+      return 4;
+    case X86::INC64r: case X86::INC64m:  case X86::DEC64r:  case X86::DEC64m:
+      return 8;
+
+    // Analyze NEG and NOT
+    case X86::NEG8r:  case X86::NEG8m:  case X86::NOT8r:  case X86::NOT8m:
+      return 1;
+    case X86::NEG16r: case X86::NEG16m: case X86::NOT16r: case X86::NOT16m:
+      return 2;
+    case X86::NEG32r: case X86::NEG32m: case X86::NOT32r: case X86::NOT32m:
+      return 4;
+    case X86::NEG64r: case X86::NEG64m: case X86::NOT64r: case X86::NOT64m:
+      return 8;
+
+    // Analyze SHIFT LEFT and SHIFT RIGHT
+    case X86::SHL8ri:  case X86::SHR8ri:  case X86::SHL8r1:  case X86::SHR8r1:
+      return 1;
+    case X86::SHL16ri:  case X86::SHR16ri:  case X86::SHL16r1:  case X86::SHR16r1:
+      return 2;
+    case X86::SHL32ri:  case X86::SHR32ri:  case X86::SHL32r1:  case X86::SHR32r1:
+      return 4;
+    case X86::SHL64ri:  case X86::SHR64ri:  case X86::SHL64r1:  case X86::SHR64r1:
+      return 8;
+
+    case X86::SHLD16rri8: case X86::SHRD16rri8:
+      return 2;
+    case X86::SHLD32rri8: case X86::SHRD32rri8:
+      return 4;
+    case X86::SHLD64rri8: case X86::SHRD64rri8:
+      return 8;
+
+    case X86::BSR16rr: case X86::BTS16ri8:
+      return 2;
+    case X86::BLSR32rr: case X86::BTS32ri8: case X86::BLSR32rm:
+      return 4;
+    case X86::BLSR64rr:	case X86::BTS64ri8: case X86::BLSR64rm:
+      return 8;
+
+    case X86::BZHI32rr: case X86::BZHI32rm:
+      return 4;
+    case X86::BZHI64rr: case X86::BZHI64rm:
+      return 8;
+
+    // Analyze UCOMISD
+    case X86::UCOMISDrr:  case X86::UCOMISDrm:  case X86::UCOMISSrr:  case X86::UCOMISSrm:
+    case X86::VCOMISDrr:  case X86::VCOMISDrm: case X86::VCOMISSrr:   case X86::VCOMISSrm:
+    case X86::VUCOMISDrr: case X86::VUCOMISDrm:  case X86::VUCOMISSrr: case X86::VUCOMISSrm: 
+    case X86::VPTESTrr:   case X86::VPTESTYrr:
+      return 8;
+
+    // Cannot be Harden
+    case X86::CMP8i8: case X86::CMP16i16: case X86::CMP32i32: case X86::CMP64i32:
+      return 3;
+
+    // Conditional Move and Conditional Set does not change the flag, so, skip them
+    case X86::CMOV16rr: case X86::CMOV16rm:
+    case X86::CMOV32rr: case X86::CMOV32rm:
+    case X86::CMOV64rr: case X86::CMOV64rm:
+    case X86::SETCCr:   case X86::SETCCm:
+      return 5;
+  }
+  return 0;
 }
 
 INITIALIZE_PASS_BEGIN(X86SpeculativeLoadHardeningPass, PASS_KEY,
@@ -2322,3 +3688,5 @@ INITIALIZE_PASS_END(X86SpeculativeLoadHardeningPass, PASS_KEY,
 FunctionPass *llvm::createX86SpeculativeLoadHardeningPass() {
   return new X86SpeculativeLoadHardeningPass();
 }
+
+
