@@ -157,8 +157,13 @@ static cl::opt<bool> EnableBlade(PASS_KEY "-blade",
 				 cl::desc("Enable Blade-inspired SLH hardening"),
 				 cl::init(false), cl::Hidden);
 
+
+static const TargetRegisterClass *
+getRegClassForUnfoldedLoad(MachineFunction &MF, const X86InstrInfo &TII,
+                           unsigned Opcode);
 namespace {
 
+    
 class X86SpeculativeLoadHardeningPass : public MachineFunctionPass {
 public:
   X86SpeculativeLoadHardeningPass() : MachineFunctionPass(ID) { }
@@ -635,53 +640,86 @@ static int getMemRefBeginIdx(const MachineInstr& MI) {
   return getMemRefBeginIdx(MI.getDesc());
 }
 
-static bool getTransmittedOperands(MachineInstr& MI, SmallVectorImpl<Register>& Ops) {
+static bool getTransmittedOperands(MachineInstr& MI, SmallSet<Register, 2>& Ops) {
+  assert(!(MI.isCall() && MI.mayLoad()));
+  
+  
   if (none_of(MI.uses(), [] (const MachineOperand& MO) {
     return MO.isReg() && MO.isUse();
   })) {
     return false;
   }
 
+  // Handle memory access transmitters.
   if (MI.mayLoad() || MI.mayStore()) {
     // Try to get memory operand.
     int MemIdx = getMemRefBeginIdx(MI);
     if (MemIdx >= 0) {
       const MachineOperand& BaseMO = MI.getOperand(MemIdx + X86::AddrBaseReg);
       if (BaseMO.isReg() && BaseMO.getReg().isVirtual())
-	Ops.push_back(BaseMO.getReg());
+	Ops.insert(BaseMO.getReg());
       const MachineOperand& IndexMO = MI.getOperand(MemIdx + X86::AddrIndexReg);
       if (IndexMO.isReg() && IndexMO.getReg().isVirtual())
-	Ops.push_back(IndexMO.getReg());
+	Ops.insert(IndexMO.getReg());
     }
-  } else {
-    switch (MI.getOpcode()) {
-    case X86::DIV8r:
-    case X86::DIV16r:
-    case X86::DIV32r:
-    case X86::DIV64r:
-      for (MachineOperand& MO : MI.uses())
-	if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
-	  Ops.push_back(MO.getReg());
-      break;
+    return !Ops.empty();
+  }
 
-    case X86::COPY:  {
-      // Check if this is part of a function call.
-      const MachineInstr *it;
-      for (it = MI.getNextNode(); it && it->getOpcode() == X86::COPY; it = it->getNextNode())
-	;
-      if (!(it && (it->isCall() || it->isReturn())))
-	break;
-      for (const MachineOperand& MO : MI.uses()) {
-	if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
-	  Ops.push_back(MO.getReg());
+  // Handle conditional branch transmitters.
+  if (any_of(MI.implicit_operands(), [] (const MachineOperand& MO) {
+    return MO.isReg() && MO.getReg() == X86::EFLAGS && MO.isImplicit() && MO.isDef();
+  })) {
+    // Check if this is used by a branch.
+    // NOTE: This isn't complete, just doing the easiest thing for now. Will be underapproximation of real overhead.
+    const MachineInstr *it;
+    for (it = MI.getNextNode(); it; it = it->getNextNode()) {
+      for (const MachineOperand& MO : it->implicit_operands()) {
+	if (MO.isReg() && MO.getReg() == X86::EFLAGS) {
+	  if (MO.isKill())
+	    goto bail;
+	  if (it->isTerminator()) {
+	    for (const MachineOperand& Use : MI.operands()) {
+	      if (Use.isReg() && Use.getReg().isVirtual() && Use.isUse()) {
+		Ops.insert(Use.getReg());
+	      }
+	    }
+	  }
+	}
       }
-      break;
     }
+
+  bail:
+    ;
+  }
+
+  
+  switch (MI.getOpcode()) {
+  case X86::DIV8r:
+  case X86::DIV16r:
+  case X86::DIV32r:
+  case X86::DIV64r:
+    for (MachineOperand& MO : MI.uses())
+      if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
+	Ops.insert(MO.getReg());
+    break;
+
+  case X86::COPY:  {
+    // Check if this is part of a function call.
+    const MachineInstr *it;
+    for (it = MI.getNextNode(); it && it->getOpcode() == X86::COPY; it = it->getNextNode())
+      ;
+    if (!(it && (it->isCall() || it->isReturn())))
+      break;
+    for (const MachineOperand& MO : MI.uses()) {
+      if (MO.isReg() && MO.isUse() && MO.getReg().isVirtual())
+	Ops.insert(MO.getReg());
+    }
+    break;
+  }
       
-    case X86::RET:
-      // TODO
-      break;
-    }
+  case X86::RET:
+    // TODO
+    break;
   }
 
   return !Ops.empty();
@@ -751,7 +789,7 @@ static void constructBladeDFG(MachineFunction& MF, BladeDFG& G) {
       for (MachineOperand& Def : MI.defs()) {
 	if (!(Def.isReg() && Def.isDef() && Def.getReg().isVirtual()))
 	  continue;
-	BladeNode src{BladeUse{Def.getReg(), &MI}};
+	BladeNode dst{BladeUse{Def.getReg(), &MI}};
 	for (MachineOperand& Use : MI.uses()) {
 	  if (!(Use.isReg() && Use.isUse() && Use.getReg().isVirtual()))
 	    continue;
@@ -759,7 +797,7 @@ static void constructBladeDFG(MachineFunction& MF, BladeDFG& G) {
 	    assert(NewDef.isReg() && NewDef.isDef());
 	    if (!NewDef.getReg().isVirtual())
 	      continue;
-	    BladeNode dst{BladeUse{NewDef.getReg(), NewDef.getParent()}};
+	    BladeNode src{BladeUse{NewDef.getReg(), NewDef.getParent()}};
 	    G[src].insert(dst);
 	  }
 	}
@@ -785,10 +823,10 @@ static void constructBladeDFG(MachineFunction& MF, BladeDFG& G) {
   // Add sink nodes + edges -- i.e., transmitters.
   for (MachineBasicBlock& MBB : MF) {
     for (MachineInstr& MI : MBB) {
-      SmallVector<Register> SensitiveOperands;
+      SmallSet<Register, 2> SensitiveOperands;
       if (!getTransmittedOperands(MI, SensitiveOperands))
 	continue;
-      errs() << "Transmitter: " << MI;
+      // errs() << "Transmitter: " << MI;
       for (Register RegUse : SensitiveOperands) {
 	for (MachineOperand& RegDef : MRI.def_operands(RegUse)) {
 	  BladeNode src{BladeUse{RegDef.getReg(), RegDef.getParent()}};
@@ -800,7 +838,7 @@ static void constructBladeDFG(MachineFunction& MF, BladeDFG& G) {
   }
 }
 
-static void dumpBladeDFG(raw_ostream& os, BladeDFG& G) {
+static void dumpBladeDFG(raw_ostream& os, BladeDFG& G, MachineFunction& MF) {
   os << "digraph {\n";
 
   os << "source [label=\"S\", color=\"green\"]\n";
@@ -837,6 +875,11 @@ static void dumpBladeDFG(raw_ostream& os, BladeDFG& G) {
       os << getName(src) << " -> " << getName(dst) << ";\n";
     }
   }
+
+  // function node
+  os << "function [label=\"";
+  MF.print(os);
+  os << "\"];\n";
   
   os << "}\n";
 }
@@ -948,16 +991,73 @@ static void bladeMinCut(BladeDFG& G, std::set<BladeUse>& cut_nodes) {
   }
 }
 
+
+static const TargetRegisterClass *
+getRegClassForUnfold(MachineFunction &MF, const X86InstrInfo &TII, MachineInstr& MI) {
+  unsigned Index;
+  unsigned UnfoldedOpc = TII.getOpcodeAfterMemoryUnfold(MI.getOpcode(),
+							/*UnfoldLoad*/ MI.mayLoad(), /*UnfoldStore*/ MI.mayLoad(), &Index);
+  const MCInstrDesc &MCID = TII.get(UnfoldedOpc);
+  return TII.getRegClass(MCID, Index, &TII.getRegisterInfo(), MF);
+}
+
 //
 void X86SpeculativeLoadHardeningPass::blade(MachineFunction& MF) {
   BladeDFG DFG;
-		    
+
+  // unfold everything
+  if (1) {
+    std::vector<MachineInstr *> worklist;
+    for (auto& MBB : MF)
+      for (auto& MI : MBB)
+	worklist.push_back(&MI);
+
+    for (auto *MI : worklist) {
+      switch (MI->getOpcode()) {
+      case X86::CMP64mr:
+      case X86::CMP64rm:
+      case X86::CMP32mr:
+      case X86::CMP32rm:
+      case X86::CMP16mr:
+      case X86::CMP16rm:
+      case X86::CMP8mr:
+      case X86::CMP8rm:
+      case X86::CMP32mi8:
+      case X86::CMP64mi8:
+	break;
+      default:
+	continue;
+      }
+      
+      auto *UnfoldedRC = getRegClassForUnfold(MF, *TII, *MI);
+      if (!UnfoldedRC)
+	continue;
+
+      SmallVector<MachineInstr *, 3> NewMIs;
+      Register Reg = MRI->createVirtualRegister(UnfoldedRC);
+      // This ins't actually complete -- consider push [rax]
+      const bool unfolded = TII->unfoldMemoryOperand(MF, *MI, Reg, MI->mayLoad(), MI->mayStore(), NewMIs);
+      if (!unfolded)
+	continue;
+      errs() << "UNFOLDED: " << *MI;
+      assert(!(MI->isCall() || MI->isReturn()));
+      auto& MBB = *MI->getParent();
+      for (auto *NewMI : NewMIs)
+	MBB.insert(MI->getIterator(), NewMI);
+      MI->eraseFromParent();
+      errs() << "INTO: ";
+      for (MachineInstr *MI : NewMIs)
+	errs() << *MI;
+    }
+  }
+
+
   constructBladeDFG(MF, DFG);
 
   // print it to dot file!
   std::ofstream f("dfg.dot");
   raw_os_ostream os(f);
-  dumpBladeDFG(os, DFG);
+  dumpBladeDFG(os, DFG, MF);
 
   // perform min cut
   std::set<BladeUse> cut_nodes;
@@ -965,6 +1065,7 @@ void X86SpeculativeLoadHardeningPass::blade(MachineFunction& MF) {
 
   // Do masking stuff
   for (BladeUse Node : cut_nodes) {
+    continue; // FIXME: erase this for now.
     if (count_if(Node.MI->defs(), [] (const MachineOperand& MO) {
       return MO.isReg() && MO.isDef();
     }) != 1) {
@@ -975,6 +1076,19 @@ void X86SpeculativeLoadHardeningPass::blade(MachineFunction& MF) {
     if (!canHardenRegister(Node.Reg)) {
       errs() << "[BLADE] cannot harden: " << *Node.MI;
       continue;
+    }
+
+    // Check if EFLAGS is live.
+    {
+      LivePhysRegs Live(*TRI);
+      Live.addLiveOuts(*Node.MI->getParent());
+      for (auto *it = &Node.MI->getParent()->back(); it != Node.MI; it = it->getPrevNode()) {
+	Live.stepBackward(*it);
+      }
+      if (Live.contains(X86::EFLAGS)) {
+	errs() << "[BLADE] warning: found live EFLAGS:\n" << *Node.MI->getParent();
+	std::abort();
+      }
     }
       
 
@@ -987,6 +1101,15 @@ void X86SpeculativeLoadHardeningPass::blade(MachineFunction& MF) {
 #else
     hardenPostLoad(*Node.MI);
 #endif
+  }
+
+  // Insert LFENCE
+  for (MachineBasicBlock& MBB : MF) {
+    for (MachineInstr& MI : MBB) {
+      if (MI.isReturn() && !MI.isCall()) {
+	BuildMI(MBB, MI.getIterator(), DebugLoc(), TII->get(X86::LFENCE));
+      }
+    }
   }
 }
 
@@ -1208,6 +1331,27 @@ X86SpeculativeLoadHardeningPass::tracePredStateThroughCFG(
             LLVM_DEBUG(dbgs() << "  Inserting cmov: "; CMovI->dump();
                        dbgs() << "\n");
 
+	    // BLADE EXPERIMENTAL
+	    if (EnableBlade) {
+	      const auto harden_fixed = [&] (Register Reg) {
+		assert(Reg.isPhysical());
+		BuildMI(CheckingMBB, InsertPt, DebugLoc(),
+			TII->get(X86::CMOV64rr), Reg)
+		  .addReg(Reg)
+		  .addReg(PS->PoisonReg)
+		  .addImm(Cond);
+	      };
+	      harden_fixed(X86::RSP);
+	      // harden_fixed(X86::RBP);
+#if 1
+	      const auto& MFI = MF.getFrameInfo();
+	      if (MF.getSubtarget<X86Subtarget>().getFrameLowering()->hasFP(MF))
+		harden_fixed(X86::RBP);
+	      if (MF.getSubtarget<X86Subtarget>().getRegisterInfo()->hasBasePointer(MF))
+		harden_fixed(X86::RBX);
+#endif
+	    }
+
             // The first one of the cmovs will be using the top level
             // `PredStateReg` and need to get rewritten into SSA form.
             if (CurStateReg == PS->InitialReg)
@@ -1220,6 +1364,7 @@ X86SpeculativeLoadHardeningPass::tracePredStateThroughCFG(
           // And put the last one into the available values for SSA form of our
           // predicate state.
           PS->SSA.AddAvailableValue(&CheckingMBB, CurStateReg);
+
         };
 
     std::vector<X86::CondCode> UncondCodeSeq;
