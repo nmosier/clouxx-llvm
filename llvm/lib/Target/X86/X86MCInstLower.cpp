@@ -2682,8 +2682,10 @@ void X86AsmPrinter::emitInstruction(const MachineInstr *MI) {
 
   EmitAndCountInstruction(TmpInst);
 
+  static const std::set<int> JmpOpcodes = {X86::JMP_1, X86::JMP_2, X86::JMP_4};
   if (clou::enabled.fallthru &&
-      (MI->isReturn() || MI->isUnconditionalBranch() || MI->isIndirectBranch())) {
+      (MI->isReturn() || MI->isUnconditionalBranch() || MI->isIndirectBranch() ||
+       JmpOpcodes.contains(MI->getOpcode()))) {
     // Add an LFENCE at the end.
     MCInst LfenceInst;
     LfenceInst.setOpcode(X86::LFENCE);
