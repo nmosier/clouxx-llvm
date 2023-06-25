@@ -1842,11 +1842,13 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
       assert(stack && "Forgot to run IR FPS pass!");
 
       // lea r11, [rel foo_stack]
+      const auto FrameSize = StackSize + 24;
+      const auto NumFrames = clou::StackSize / FrameSize;
       BuildMI(MBB, MBBI, DL, TII.get(X86::LEA64r), X86::R11)
 	.addReg(X86::RIP)
 	.addImm(1)
 	.addReg(X86::NoRegister)
-	.addGlobalAddress(stack, 0)
+	.addGlobalAddress(stack, clou::StackSize - NumFrames * FrameSize)
 	.addReg(X86::NoRegister);
       
       // cmp rsp, r11
