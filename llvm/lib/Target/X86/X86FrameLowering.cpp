@@ -1835,7 +1835,7 @@ void X86FrameLowering::emitPrologue(MachineFunction &MF,
   }
 
   // LLSCT: Take max of stack begin and new pointer
-  if (clou::enabled.fps) {
+  if (clou::enabled.fps && clou::FPSNoFault) {
     const Function& F = MF.getFunction();
     if (!F.hasFnAttribute(clou::FnAttr_fps_usestack)) {
       const GlobalValue *stack = F.getParent()->getNamedValue((F.getName() + "_stack").str());

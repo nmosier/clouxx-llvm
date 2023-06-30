@@ -98,6 +98,19 @@ namespace {
       }
       const auto& TRI = *MF.getSubtarget<X86Subtarget>().getRegisterInfo();
 
+
+      // ipredd
+      if (clou::enabled.ipredd) {
+	for (MachineBasicBlock& MBB : MF) {
+	  for (MachineInstr& MI : MBB) {
+	    if (MI.isCall()) {
+	      BuildMI(MBB, MI.getIterator(), DebugLoc(), TII->get(X86::LFENCE));
+	    }
+	  }
+	}
+      }
+      
+
       for (auto& MBB : MF) {
 	for (auto MBBI = MBB.begin(); MBBI != MBB.end(); ++MBBI) {
 	  if (MBBI->isCall()) {

@@ -13,6 +13,7 @@ namespace clou {
   extern bool ClouNoSpill;
   extern bool ClouLog;
   extern std::string ClouLogDir;
+  extern bool TraceNCAs;
 
 #define SUBCOMPONENTS_X(X, Y)			\
   X(ncal_xmit, true)				\
@@ -27,7 +28,8 @@ namespace clou {
   X(stackinit, false)				\
   X(prech, true)				\
   X(postch, true)				\
-  Y(fallthru, true)
+  X(ipredd, false)				\
+  Y(fallthru, false)
   
 
   
@@ -77,6 +79,8 @@ namespace clou {
 
   extern bool NCASAll;
   extern float Timeout;
+
+  extern bool FPSNoFault;
 }
 
 

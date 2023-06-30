@@ -245,4 +245,12 @@ namespace clou {
     llvm::cl::location(Timeout),
     llvm::cl::init(0)
   };
+
+  bool FPSNoFault;
+  static llvm::cl::opt<bool, true> FPSNoFaultOpt {
+    "llsct-fps-nofault",
+    llvm::cl::desc("Use securer no-fault approach for Function Private Stacks"),
+    llvm::cl::location(FPSNoFault),
+    llvm::cl::init(true),
+  };
 }
