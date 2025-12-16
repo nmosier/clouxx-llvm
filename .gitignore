@@ -70,3 +70,6 @@ pythonenv*
 /lldb/docs/python_api/
 \#*\#
 *.bak
+
+# Serberus
+/install/
